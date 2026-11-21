@@ -26,6 +26,7 @@ static struct book8_media_source media_candidates[8];
 static struct book8_net browser_test_net;
 static uint8_t browser_test_tx[BOOK8_NET_FRAME_MAX];
 static size_t browser_test_tx_size;
+static uint64_t host_ticks = 1u;
 
 #define BROWSER_TEST_LOCAL BOOK8_NET_IP(192, 168, 7, 10)
 #define BROWSER_TEST_DNS BOOK8_NET_IP(192, 168, 7, 53)
@@ -84,7 +85,7 @@ static void draw_text(uint32_t x, uint32_t y, const char *text,
 
 static uint64_t ticks(void)
 {
-    return 1u;
+    return host_ticks;
 }
 
 bool book8_network_settings_get(struct book8_network_status *status)
@@ -321,6 +322,53 @@ static void setup_browser_network(void)
     memcpy(browser_test_net.arp[0].mac, dns_mac, sizeof(dns_mac));
     browser_test_net.arp[1].ip = BROWSER_TEST_WEB;
     memcpy(browser_test_net.arp[1].mac, web_mac, sizeof(web_mac));
+}
+
+static void http_get(struct WindowApp *app,
+    const struct book8gui_platform *platform, const char *url,
+    const char *response)
+{
+    host_ticks = 1u;
+    assert(book8_browser_class.open_path(platform, app, url));
+    book8_browser_class.tick(platform, app);
+    assert(browser_test_tx_size > 54u && browser_test_tx[23] == 6u
+        && browser_test_tx[47] == 2u);
+    const uint8_t *syn = browser_test_tx + 34u;
+    uint32_t client_sequence = ((uint32_t)syn[4] << 24u)
+        | ((uint32_t)syn[5] << 16u) | ((uint32_t)syn[6] << 8u) | syn[7];
+    uint16_t client_port = (uint16_t)(((uint16_t)syn[0] << 8u) | syn[1]);
+    inject_tcp(BROWSER_TEST_WEB, 80u, client_port, 1000u,
+        client_sequence + 1u, 0x12u, NULL, 0u);
+    book8_browser_class.tick(platform, app);
+    book8_browser_class.tick(platform, app);
+    uint32_t request_size = (uint32_t)(browser_test_tx_size - 54u);
+    uint32_t request_ack = client_sequence + 1u + request_size;
+    size_t response_size = strlen(response);
+    inject_tcp(BROWSER_TEST_WEB, 80u, client_port, 1001u, request_ack,
+        0x18u, (const uint8_t *)response, response_size);
+    book8_browser_class.tick(platform, app);
+}
+
+static void expect_http_request(struct WindowApp *app,
+    const struct book8gui_platform *platform, const char *path)
+{
+    book8_browser_class.tick(platform, app);
+    assert(browser_test_tx_size > 54u && browser_test_tx[23] == 6u
+        && browser_test_tx[47] == 2u);
+    uint8_t *syn = browser_test_tx + 34u;
+    uint32_t sequence = ((uint32_t)syn[4] << 24u)
+        | ((uint32_t)syn[5] << 16u) | ((uint32_t)syn[6] << 8u) | syn[7];
+    uint16_t client_port = (uint16_t)(((uint16_t)syn[0] << 8u) | syn[1]);
+    inject_tcp(BROWSER_TEST_WEB, 80u, client_port, 2000u,
+        sequence + 1u, 0x12u, NULL, 0u);
+    book8_browser_class.tick(platform, app);
+    book8_browser_class.tick(platform, app);
+    char expected[256];
+    int length = snprintf(expected, sizeof(expected),
+        "GET %s HTTP/1.1\r\n", path);
+    assert(length > 0 && (size_t)length < sizeof(expected));
+    assert(browser_test_tx_size > 54u
+        && memcmp(browser_test_tx + 54u, expected, (size_t)length) == 0);
 }
 
 static bool write_file(const char *path, const void *data, uint32_t size)
@@ -611,7 +659,11 @@ int main(void)
             sizeof(expected_request) - 1u) == 0);
     uint32_t request_size = (uint32_t)(browser_test_tx_size - 54u);
     uint32_t request_ack = client_sequence + 1u + request_size;
-    const char body[] = "<html><body><h1>Google text works</h1>"
+    const char body[] = "<html><head><title>BOOK8 &amp; News</title>"
+        "<base href='http://192.168.7.20/docs/'></head>"
+        "<body><h1>Google text works</h1>"
+        "<p>Tom &amp; Jerry &#8212; &#x2026; &copy;</p>"
+        "<ul><li><a href='page2.html?a=1&amp;b=2'>Next page</a></li></ul>"
         "<audio src='tone.wav'></audio><video src='clip.mp4'></video>"
         "</body></html>";
     char response[512];
@@ -634,7 +686,7 @@ int main(void)
     bool displayed_google_text = false;
     bool displayed_audio_link = false, displayed_video_link = false;
     for (uint32_t i = 0u; i < drawn_text_count; ++i) {
-        if (strstr(drawn_text[i], "Google text works") != NULL) {
+        if (strstr(drawn_text[i], "h1: Google text works") != NULL) {
             displayed_google_text = true;
         }
         if (strstr(drawn_text[i], "Audio WAV") != NULL) {
@@ -646,6 +698,27 @@ int main(void)
     }
     assert(displayed_google_text && displayed_audio_link
         && displayed_video_link);
+    assert(strcmp(app.title, "Internet Explorer - BOOK8 & News") == 0);
+    bool displayed_entities = false, displayed_anchor_label = false;
+    for (uint32_t i = 0u; i < drawn_text_count; ++i) {
+        if (strstr(drawn_text[i], "Tom & Jerry - ... (c)") != NULL) {
+            displayed_entities = true;
+        }
+        if (strstr(drawn_text[i], "Next page") != NULL) {
+            displayed_anchor_label = true;
+        }
+    }
+    assert(displayed_entities && displayed_anchor_label);
+
+    event = (struct book8gui_event){
+        .type = BOOK8GUI_EVENT_MOUSE,
+        .mouse_x = 45,
+        .mouse_y = 188,
+        .mouse_buttons = 1u
+    };
+    assert(book8_browser_class.handle_event(&platform, &app, &event));
+    expect_http_request(&app, &platform,
+        "/docs/page2.html?a=1&b=2");
 
     assert(book8_browser_class.open_path(&platform, &app,
         "http://192.168.7.20/tone.wav"));
@@ -683,6 +756,42 @@ int main(void)
     assert(media_play_calls == 2u);
     book8_browser_class.render(&platform, &app);
     assert(strcmp(last_text, "Playing WAV audio.") == 0);
+    book8_browser_class.destroy(app.state);
+
+    app = (struct WindowApp){
+        .title = book8_browser_class.name,
+        .bounds = {20u, 20u, 820u, 560u}
+    };
+    app.state = book8_browser_class.create(&platform);
+    assert(app.state != NULL);
+    http_get(&app, &platform, "http://192.168.7.20/start.html",
+        "HTTP/1.1 302 Found\r\nLocation: /final.html\r\n"
+        "Content-Length: 0\r\n\r\n");
+    expect_http_request(&app, &platform, "/final.html");
+    book8_browser_class.destroy(app.state);
+
+    app = (struct WindowApp){
+        .title = book8_browser_class.name,
+        .bounds = {20u, 20u, 820u, 560u}
+    };
+    app.state = book8_browser_class.create(&platform);
+    assert(app.state != NULL);
+    static const char refresh_body[] =
+        "<html><head><meta http-equiv='refresh' "
+        "content='0; url=/refreshed.html'></head>"
+        "<body>Refresh test</body></html>";
+    char refresh_response[512];
+    int refresh_length = snprintf(refresh_response, sizeof(refresh_response),
+        "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n"
+        "Content-Type: text/html\r\n\r\n%s",
+        (unsigned)(sizeof(refresh_body) - 1u), refresh_body);
+    assert(refresh_length > 0
+        && (size_t)refresh_length < sizeof(refresh_response));
+    http_get(&app, &platform, "http://192.168.7.20/refresh.html",
+        refresh_response);
+    host_ticks = 5000u;
+    book8_browser_class.tick(&platform, &app);
+    expect_http_request(&app, &platform, "/refreshed.html");
     book8_browser_class.destroy(app.state);
     return 0;
 }

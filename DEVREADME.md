@@ -510,27 +510,34 @@ their windows are closed. PaintBook opens BMP, GIF, JPEG and PNG files up to
 undo step, and saves drawings as BMP. Its open/save dialogs accept absolute FAT
 paths.
 
-Web Browser provides classic Back/Forward/Stop/Refresh/Home/Go controls, an
-editable address bar, a short history and clickable links from simple HTML pages.
-Settings can persist the current supported address as the homepage and clear
-session cookies. It supports bounded plain HTTP requests to IPv4 addresses or
-hostnames resolved through the configured DHCP DNS server, text/plain, basic
-text/html and standalone BMP/GIF/JPEG/PNG images, with chunked transfer decoding
-and a 512 KiB response limit. HTML image links are listed for opening as
-standalone images; audio/video/source tags and direct media links are listed in
-Page Links. HTTP WAV audio is passed to the shared HDA playback path; only PCM
-48 kHz stereo 16-bit WAV is accepted. Video and other audio codecs display an
-unsupported-format status. Inline media layout is not supported. HTTPS/TLS,
-JavaScript, redirects, adaptive streaming, YouTube and modern browser standards
-are not supported. Google responds over HTTP with a chunked page, but may require
+Web Browser now uses an Internet Explorer-style chrome: raised beveled menu and
+toolbar buttons with small Back/Forward/Stop/Refresh/Home/Go icons, hover and
+pressed feedback, a separate Address field and Go button, and a scrollbar on
+long pages. It keeps an editable address bar, a short history and clickable
+links. Settings can persist the current supported address as the homepage and
+clear session cookies. It supports bounded plain HTTP requests to IPv4 addresses
+or hostnames resolved through the configured DHCP DNS server, text/plain and
+modern HTML documents rendered as readable text. The parser understands semantic
+HTML5 block tags, `<title>`, `<base href>`, character/numeric entities, headings,
+lists and table-cell separators, resolves relative links, makes inline anchor
+text clickable, follows up to four HTTP 3xx `Location` redirects, and honors
+`Refresh` headers and `<meta http-equiv="refresh">` navigation. Standalone
+BMP/GIF/JPEG/PNG images are decoded and shown; image, audio/video/source and
+direct media links are listed in Page Links. Chunked transfer decoding and a
+512 KiB response limit remain. HTTP WAV audio is passed to the shared HDA
+playback path; only PCM 48 kHz stereo 16-bit WAV is accepted. Video and other
+audio codecs display an unsupported-format status. Inline media layout, HTTPS/
+TLS, JavaScript, CSS layout, adaptive streaming, YouTube and video codecs are
+not supported. Google responds over HTTP with a chunked page, but may require
 JavaScript to display search results; the browser can show its static response
 text, not the interactive results. Network requests use the existing single
 outgoing TCP context.
 The host build also runs `book8_image_host_test` for BMP decoding and
 dimension/input bounds and decoder-pool isolation, and `book8_apps_host_test`
 for PaintBook drawing/BMP export, player WAV/volume/seek controls, browser
-homepage/cookie controls, media link detection and HTTP WAV playback routing,
-startup and unsupported-address handling. `build.sh` packages the browser as
+homepage/cookie controls, entity/title parsing, relative inline-link clicks,
+HTTP redirects, meta-refresh navigation, media link detection and HTTP WAV
+playback routing, startup and unsupported-address handling. `build.sh` packages the browser as
 `A:\\BIN\\BROWSER.ELF` in the boot-time application image.
 
 ### NV Diagnostic
