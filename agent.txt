@@ -1,0 +1,8 @@
+Add a dedicated "Agent Model & Runtime" configuration panel to the book8 control panel without
+ modifying the existing subcategories. The new panel should include:
+1. A backend connection configuration form (endpoint URI or local path for the model/GGUF runner).
+2. Permission toggle switches for system-level agent navigation (UI control, network diagnostics, 
+storage inspection).
+3. A live status indicator and audit log display showing the agent's recent tool calls and system
+ interactions.
+4. Update the system config struct to persist these agent runtime preferences cleanly.

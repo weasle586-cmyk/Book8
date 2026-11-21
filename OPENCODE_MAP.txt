@@ -1,0 +1,19 @@
+Fix BAR1 SPT layout and teardown zero ranges.X
+
+Save/restore all PFIFO/runlist/interrupt/BAR1 USERD state.X
+
+Add unmap_mmio.X
+
+Fix multifunction probe and PCI command write.X
+
+Fix scratch clear size.X
+
+Rewrite tests/nv_maxwell_host_test.c for CE and add layout/restore regressions.X
+
+Expose acceleration stats through hwdiag/NVDIAG.X
+
+Add book8.nv.accel=off|auto|on; keep off/CPU default until a real GTX 970/980 run passes.
+
+Add NVTEST scratch-only fill/copy/scroll stress with serial output.
+
+Wire present into fb_present_rect() as a separate change after 1–9 are green.

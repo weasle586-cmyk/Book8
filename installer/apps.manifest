@@ -1,0 +1,7 @@
+# source|destination|app_key|display_name|app_class|hidden|system_component
+hexview.elf|HEXVIEW.ELF|HexViewer|Hex Viewer|hexview|0|0
+codeedit.elf|CODEEDIT.ELF|CodeEditor|Code Editor|codeedit|0|0
+netshare.elf|NETSHARE.ELF|NetworkBrowser|Network Share Browser|netshare|0|0
+paintbook.elf|PAINTBK.ELF|PaintBook|PaintBook|paint|0|0
+browser.elf|BROWSER.ELF|WebBrowser|Web Browser|browser|0|0
+nvdiag.elf|NVDIAG.ELF|NVDiagnostic|NV Diagnostic|nvdiag|0|0

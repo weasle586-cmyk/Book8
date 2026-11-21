@@ -1,0 +1,21 @@
+Implement a robust, safe shutdown and power-off sequence for the BOOK8 kernel, transitioning from
+ a simple hard halt (`hlt`) to a structured multi-core tear-down and ACPI power management routine.
+
+Apply these technical requirements:
+1. **AP Coordination (IPI Broadcast):** When a shutdown is triggered, broadcast a shutdown or stop 
+Inter-Processor Interrupt (IPI) from the Bootstrap Processor (BSP) to all active Application Processors (APs), ensuring they safely exit their local run-queues and idle loop.
+
+2. **File System & Cache Flashing:** Force-flush all pending FAT16/FAT32 volume buffers, directory
+ metadata, and dirty cache blocks to storage to prevent data corruption or orphaned clusters.
+
+3. **Driver Tear-Down:** Iterate through the active dynamic driver list (`AC97.DRV`, `USBHOST.DRV`, 
+`RTL8168.DRV`, `NVMAXWEL.DRV`), invoking their respective cleanup/unload hooks to idle hardware 
+controllers, stop DMA engines, and release allocated memory pages safely.
+
+4. **ACPI Power-Off & Fallback:** Parse the ACPI FADT (Fixed ACPI Description Table) to locate and
+ trigger the Sleep Control Register / SLP_TYP value for a clean power-down. Fall back to a safe
+ infinite halt loop (`cli; hlt`) only if ACPI power management is unavailable.
+
+5. **Build & Integration:** Update the kernel command dispatch, build scripts, and test harnesses 
+to include the new shutdown routine. Ensure all QEMU and bare-metal builds compile without
+ regressions.

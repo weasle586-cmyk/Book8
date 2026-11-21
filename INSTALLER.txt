@@ -1,0 +1,11 @@
+Create a Win2000-style text/graphical hybrid installer UI for BOOK8OS. 
+
+1. UI Layout: Classic Win2K setup aesthetic (blue background, gray prompt boxes, clear drive 
+selection list, and a solid progress bar docked at the bottom).
+
+2. Disk Allocation: Fix the disk layout routine so the installer targets and populates the entire 
+physical hard drive space rather than a restricted partition slice.
+
+3. Partition Scan & Quick Format: Implement a signature scan during disk detection. If an existing
+ BOOK8 filesystem signature is found, preserve the partition structure, execute a quick format on 
+the target volume, and proceed with the clean reinstall without wiping the full partition table.

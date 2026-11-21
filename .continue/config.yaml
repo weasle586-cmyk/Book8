@@ -1,0 +1,13 @@
+name: BOOK8 Local Ollama
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Llama 3.1 8B
+    provider: ollama
+    model: llama3.1:8b
+    apiBase: http://localhost:11434
+    roles:
+      - chat
+      - edit
+      - apply
