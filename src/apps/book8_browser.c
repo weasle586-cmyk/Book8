@@ -2,6 +2,7 @@
 #include "book8_ui.h"
 
 #include <stddef.h>
+#include "../../include/syscall.h"
 #include "../../include/stdio.h"
 #include "../../include/string.h"
 #include "book8_image.h"
@@ -2017,7 +2018,9 @@ static void html_to_text(const char *body, uint32_t size)
         }
     }
     browser.page_rows_total = browser.page_lines;
-    (void)book8_media_scan_html(body, size, add_media_source, NULL);
+    if ((book8_media_prefs()->web & BOOK8_MEDIA_WEB_MEDIA_PANEL) != 0u) {
+        (void)book8_media_scan_html(body, size, add_media_source, NULL);
+    }
 }
 
 static void count_page_lines(void)
@@ -2041,21 +2044,39 @@ static void display_body(const struct book8gui_platform *p,
             "Video playback is unsupported. BOOK8 does not include a video decoder.");
         browser.page_length = (uint32_t)strlen(browser.page);
     } else if (browser.audio_content) {
-        if (p->media_play_wav != NULL
-            && p->media_play_wav((const uint8_t *)body, size)) {
+        const struct book8_media_preferences *prefs = book8_media_prefs();
+        bool plugin_enabled =
+            (prefs->plugins & BOOK8_MEDIA_PLUGIN_HTTP_WAV) != 0u;
+        bool autoplay_enabled =
+            (prefs->web & BOOK8_MEDIA_WEB_AUTOPLAY) != 0u;
+        bool played = plugin_enabled && autoplay_enabled
+            && p->media_play_wav != NULL
+            && p->media_play_wav((const uint8_t *)body, size);
+        if (played) {
             snprintf(browser.page, sizeof(browser.page),
                 "WAV audio is playing through the HDA output.\n"
                 "Open BOOK8 Player to control playback.");
-            browser.page_length = (uint32_t)strlen(browser.page);
-            browser.state = BROWSER_READY;
             set_status("Playing WAV audio.");
-            set_title(app);
-            book8gui_invalidate();
-            return;
+            browser.state = BROWSER_READY;
+        } else if (!plugin_enabled) {
+            snprintf(browser.page, sizeof(browser.page),
+                "HTTP WAV playback is disabled.\n"
+                "Enable the HTTP stream plugin in BOOK8 Player Preferences.");
+            set_status("Web audio plugin disabled.");
+        } else if (!autoplay_enabled) {
+            snprintf(browser.page, sizeof(browser.page),
+                "Web audio autoplay is disabled.\n"
+                "Enable it in BOOK8 Player Preferences to play HTTP WAV files.");
+            set_status("Web audio autoplay disabled.");
+        } else {
+            snprintf(browser.page, sizeof(browser.page),
+                "Audio playback supports PCM 48 kHz stereo 16-bit WAV only.");
+            set_status("Web audio format is unsupported.");
         }
-        snprintf(browser.page, sizeof(browser.page),
-            "Audio playback supports PCM 48 kHz stereo 16-bit WAV only.");
         browser.page_length = (uint32_t)strlen(browser.page);
+        set_title(app);
+        book8gui_invalidate();
+        return;
     } else if (browser.image_content) {
         struct book8_decoded_image image;
         if (!book8_image_decode_with_pool((const uint8_t *)body, size,
@@ -2307,6 +2328,16 @@ static void follow_link(uint32_t index, const struct book8gui_platform *p,
     if (!resolve_url(base, href, target, sizeof(target))
         || starts_with(target, "https://")) {
         set_status("That link uses an unsupported address or HTTPS/TLS.");
+        book8gui_invalidate();
+        return;
+    }
+    if (browser.links[index].media_kind == BOOK8_MEDIA_WAV
+        && (book8_media_prefs()->web & BOOK8_MEDIA_WEB_OPEN_IN_PLAYER) != 0u) {
+        if (book8gui_queue_utility(BOOK8_GUI_PLAYER, target) == 0) {
+            set_status("Opened WAV link in BOOK8 Player.");
+        } else {
+            set_status("BOOK8 Player is unavailable for this link.");
+        }
         book8gui_invalidate();
         return;
     }
@@ -2987,6 +3018,7 @@ static void *create(const struct book8gui_platform *p)
     close_connection();
     book8_image_pool_release(&browser_image_pool);
     browser = (struct browser_app){.text_scale = 1u};
+    (void)book8_media_prefs_load(p);
     browser.hover_nav = BROWSER_HOVER_NONE;
     browser.pressed_nav = BROWSER_HOVER_NONE;
     browser.hover_link = -1;

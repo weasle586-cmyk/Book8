@@ -62,7 +62,7 @@ The project is small but complete enough to understand as a single kernel build.
 - `src/boot.S`: Multiboot2 header, page-table setup, 32-bit to 64-bit transition, and handoff to `kernel_main()`.
 - `src/kernel.c`: the main kernel implementation: console, storage discovery, IDE/AHCI drivers, USB input, shell, GUI bridge, installer logic, and command dispatcher.
 - `drivers/ata_dma.h` and `drivers/ata_dma.c`: PCI IDE bus-master DMA (READ/WRITE DMA and DMA EXT, LBA28/LBA48) with a 64 KiB-aligned bounce buffer shared with AHCI multi-sector transfers. `kernel.c` chunks block-layer requests (up to 128 sectors), retries once, then falls back to single-sector PIO. At boot each DMA/AHCI disk prints `STORAGE: <disk> ... selftest PASS|FAIL`, checked by `tests/qemu_storage_test.py`; `tests/ata_dma_host_test.c` unit-tests the register encoding. The same QEMU test also attaches IDE and AHCI scratch disks (sector 0 = `BOOK8SCRATCH`; the kernel's destructive write self-test runs only on such disks), checks DMA write/flush/read-back, injected bus-master/timeout/device faults (`ata_inject_fault`), and a 200-sector chunked write, then verifies the images from the host including guard sectors.
-- `drivers/hda.h`, `drivers/hda.c` and `drivers/hda_stream.c`: ATI SB7xx HDA at PCI `00:14.2`, using firmware BARs, bus-master enable and the SB7xx snoop bit at PCI config `0x42` while preserving `0x44`/`0x4c`. It initializes CORB/RIRB, discovers the VIA codec's widget connections, routes 48 kHz stereo S16 audio to rear green and front headphone pins, and retains the route amplifier controls. The desktop taskbar adds a classic gray vertical volume popup and mute control between network indicators and the clock. `BOOK8 Player` reads local WAV files and supports PCM 48 kHz stereo 16-bit playback, pause/resume, seek, stop, and HDA volume control. Browser audio media can use the same path for bounded HTTP WAV responses. Stream refill is polled on desktop frames; IRQ delivery remains masked because BOOK8 does not yet route this controller's IRQ. WAVs are capped at 2 MiB locally and browser responses at 512 KiB. MP3/other codecs, HTTPS/TLS, JavaScript, adaptive streaming, YouTube and video decoding are unsupported. Host tests cover codec routing/gain/mute, stream parsing/refills and GUI/browser controls; physical ATI/VIA audio has not been verified.
+- `drivers/hda.h`, `drivers/hda.c` and `drivers/hda_stream.c`: ATI SB7xx HDA at PCI `00:14.2`, using firmware BARs, bus-master enable and the SB7xx snoop bit at PCI config `0x42` while preserving `0x44`/`0x4c`. It initializes CORB/RIRB, discovers the VIA codec's widget connections, routes 48 kHz stereo S16 audio to rear green and front headphone pins, and retains the route amplifier controls. The desktop taskbar adds a classic gray vertical volume popup and mute control between network indicators and the clock. `BOOK8 Player` now has a VLC-style dark interface with a menu bar (Media, Playback, Audio, Video, Subtitle, Tools, View, Help), transport toolbar, seek bar, volume slider, playlist, bookmarks, Jump to Time, and a Tools/Preferences dialog. It reads local WAV files and supports PCM 48 kHz stereo 16-bit playback, pause/resume, seek, stop, repeat, and HDA volume/mute control. Browser audio media can use the same path for bounded HTTP WAV responses. Stream refill is polled on desktop frames; IRQ delivery remains masked because BOOK8 does not yet route this controller's IRQ. WAVs are capped at 2 MiB locally and browser responses at 512 KiB. MP3/other codecs, HTTPS/TLS, JavaScript, adaptive streaming, YouTube and video decoding are unsupported. Host tests cover codec routing/gain/mute, stream parsing/refills and GUI/browser controls; physical ATI/VIA audio has not been verified.
 - `drivers/pcie.h` and `drivers/pcie.c`: validated below-4-GiB MCFG/ECAM access,
   conventional segment-zero fallback, firmware topology enumeration and
   upstream-first PCI D0 preparation for GTX 970 `01:00.0`. PCI word writes
@@ -500,6 +500,29 @@ temporary FAT copy. Stock QEMU has no RTL8168/8169 device, so it cannot establis
 live SMB using the current NIC driver. Do not equate its GUI pass with live
 hardware network validation.
 
+### BOOK8 Player
+
+BOOK8 Player is the desktop's VLC-style sound player. Its Media menu opens a
+local WAV file, an HTTP WAV/network stream (handed to Web Browser), or a folder
+as a generated playlist; Playback offers previous/next, Jump to Specific Time,
+bookmarks and playback-speed markers; Audio exposes stereo/mono status, mute,
+visualization and maximum volume; Tools opens Preferences, Codec Information
+and Reset Preferences. The dark canvas shows an orange cone glyph, track-status
+text and an optional spectrum-style visualization while playing.
+
+Preferences are persisted in `A:\MEDIA.CFG` and shared with Web Browser. The
+dialog has Interface (status bar/startup playlist/dark canvas), Audio (maximum
+volume), Input/Codecs and Media Plugins (PCM WAV, HTTP WAV stream, playlist and
+visualization plugins), Browser Integration (HTTP WAV autoplay, Page Links media
+discovery, opening WAV links in Player), and Hotkeys sections. Browser playback
+honors these settings: disabled HTTP WAV plugins or autoplay show a status and
+skip playback; disabled media discovery omits audio/video sources from Page
+Links; enabled WAV-link handoff queues the URL for Player. Playback speed,
+mono mixing, video tracks, subtitles and fullscreen are informational only
+because the audio path plays at the WAV's source rate and no video decoder is
+present. Only PCM 48 kHz stereo 16-bit WAV is accepted; MP3/other codecs,
+HTTPS/TLS, adaptive streaming, YouTube and video decoding remain unsupported.
+
 ### PaintBook and Web Browser
 
 `user/utility.c` builds PaintBook (packaged as the FAT-compatible
@@ -534,10 +557,12 @@ text, not the interactive results. Network requests use the existing single
 outgoing TCP context.
 The host build also runs `book8_image_host_test` for BMP decoding and
 dimension/input bounds and decoder-pool isolation, and `book8_apps_host_test`
-for PaintBook drawing/BMP export, player WAV/volume/seek controls, browser
-homepage/cookie controls, entity/title parsing, relative inline-link clicks,
-HTTP redirects, meta-refresh navigation, media link detection and HTTP WAV
-playback routing, startup and unsupported-address handling. `build.sh` packages the browser as
+for PaintBook drawing/BMP export, player menus/dialogs, WAV/volume/seek controls,
+network-stream handoff, preferences persistence, browser homepage/cookie
+controls, entity/title parsing, relative inline-link clicks, HTTP redirects,
+meta-refresh navigation, media link detection, preference-gated HTTP WAV
+playback and media discovery, startup and unsupported-address handling.
+`build.sh` packages the browser as
 `A:\\BIN\\BROWSER.ELF` in the boot-time application image.
 
 ### NV Diagnostic

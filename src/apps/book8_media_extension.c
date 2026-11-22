@@ -2,6 +2,127 @@
 
 #include "../../include/stdio.h"
 #include "../../include/string.h"
+#include "../book8gui.h"
+
+#define MEDIA_PREFS_MAGIC 0x314d3842u
+#define MEDIA_PREFS_VERSION 1u
+#define MEDIA_PREFS_BYTES 28u
+
+static struct book8_media_preferences media_preferences = {
+    BOOK8_MEDIA_IF_STATUS,
+    BOOK8_MEDIA_PLUGIN_PCM_WAV | BOOK8_MEDIA_PLUGIN_HTTP_WAV
+        | BOOK8_MEDIA_PLUGIN_PLAYLIST,
+    BOOK8_MEDIA_WEB_AUTOPLAY | BOOK8_MEDIA_WEB_MEDIA_PANEL
+        | BOOK8_MEDIA_WEB_OPEN_IN_PLAYER,
+    100u,
+    BOOK8_MEDIA_REPEAT_NONE
+};
+
+static void media_put32(uint8_t *bytes, uint32_t value)
+{
+    for (uint32_t i = 0u; i < 4u; ++i) {
+        bytes[i] = (uint8_t)(value >> (i * 8u));
+    }
+}
+
+static uint32_t media_get32(const uint8_t *bytes)
+{
+    uint32_t value = 0u;
+    for (uint32_t i = 0u; i < 4u; ++i) {
+        value |= (uint32_t)bytes[i] << (i * 8u);
+    }
+    return value;
+}
+
+static uint32_t media_checksum(const uint8_t *bytes, uint32_t size)
+{
+    uint32_t hash = 2166136261u;
+    for (uint32_t i = 0u; i < size; ++i) {
+        hash = (hash ^ bytes[i]) * 16777619u;
+    }
+    return hash;
+}
+
+const struct book8_media_preferences *book8_media_prefs(void)
+{
+    return &media_preferences;
+}
+
+void book8_media_prefs_defaults(struct book8_media_preferences *prefs)
+{
+    if (prefs == NULL) {
+        return;
+    }
+    prefs->interface_flags = BOOK8_MEDIA_IF_STATUS;
+    prefs->plugins = BOOK8_MEDIA_PLUGIN_PCM_WAV
+        | BOOK8_MEDIA_PLUGIN_HTTP_WAV | BOOK8_MEDIA_PLUGIN_PLAYLIST;
+    prefs->web = BOOK8_MEDIA_WEB_AUTOPLAY | BOOK8_MEDIA_WEB_MEDIA_PANEL
+        | BOOK8_MEDIA_WEB_OPEN_IN_PLAYER;
+    prefs->max_volume = 100u;
+    prefs->repeat = BOOK8_MEDIA_REPEAT_NONE;
+}
+
+bool book8_media_prefs_equal(const struct book8_media_preferences *a,
+    const struct book8_media_preferences *b)
+{
+    if (a == NULL || b == NULL) {
+        return false;
+    }
+    return a->interface_flags == b->interface_flags && a->plugins == b->plugins
+        && a->web == b->web && a->max_volume == b->max_volume
+        && a->repeat == b->repeat;
+}
+
+bool book8_media_prefs_load(const struct book8gui_platform *platform)
+{
+    if (platform == NULL || platform->read_file == NULL) {
+        return false;
+    }
+    uint8_t bytes[MEDIA_PREFS_BYTES] = {0};
+    uint32_t size = 0u;
+    if (!platform->read_file(BOOK8_MEDIA_PREFS_PATH, bytes, sizeof(bytes), &size)
+        || size != sizeof(bytes)
+        || media_get32(bytes) != MEDIA_PREFS_MAGIC
+        || media_get32(bytes + 4u) != MEDIA_PREFS_VERSION
+        || media_get32(bytes + 24u)
+            != media_checksum(bytes, 24u)) {
+        return false;
+    }
+    struct book8_media_preferences decoded = {
+        media_get32(bytes + 8u), media_get32(bytes + 12u),
+        media_get32(bytes + 16u), bytes[20u], bytes[21u]
+    };
+    if (decoded.max_volume == 0u || decoded.max_volume > 100u
+        || decoded.repeat > BOOK8_MEDIA_REPEAT_ONE) {
+        return false;
+    }
+    media_preferences = decoded;
+    return true;
+}
+
+bool book8_media_prefs_save(const struct book8gui_platform *platform,
+    const struct book8_media_preferences *prefs)
+{
+    if (platform == NULL || platform->write_file == NULL || prefs == NULL
+        || prefs->max_volume == 0u || prefs->max_volume > 100u
+        || prefs->repeat > BOOK8_MEDIA_REPEAT_ONE) {
+        return false;
+    }
+    uint8_t bytes[MEDIA_PREFS_BYTES] = {0};
+    media_put32(bytes, MEDIA_PREFS_MAGIC);
+    media_put32(bytes + 4u, MEDIA_PREFS_VERSION);
+    media_put32(bytes + 8u, prefs->interface_flags);
+    media_put32(bytes + 12u, prefs->plugins);
+    media_put32(bytes + 16u, prefs->web);
+    bytes[20u] = prefs->max_volume;
+    bytes[21u] = prefs->repeat;
+    media_put32(bytes + 24u, media_checksum(bytes, 24u));
+    if (!platform->write_file(BOOK8_MEDIA_PREFS_PATH, bytes, sizeof(bytes))) {
+        return false;
+    }
+    media_preferences = *prefs;
+    return true;
+}
 
 enum media_container {
     MEDIA_CONTAINER_NONE,

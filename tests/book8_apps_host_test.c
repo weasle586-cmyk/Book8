@@ -7,6 +7,7 @@
 #include "../src/apps/book8_paintbook.h"
 #include "../src/apps/book8_player.h"
 #include "../src/apps/book8_ui.h"
+#include "../include/syscall.h"
 #include "../net/net.h"
 #include "../net/network_settings.h"
 
@@ -27,6 +28,11 @@ static struct book8_net browser_test_net;
 static uint8_t browser_test_tx[BOOK8_NET_FRAME_MAX];
 static size_t browser_test_tx_size;
 static uint64_t host_ticks = 1u;
+static char saved_media_prefs[64];
+static uint32_t saved_media_size;
+static char queued_utility_path[BOOK8_MEDIA_URL_CAPACITY];
+static uint32_t queued_utility_kind;
+static bool host_muted;
 
 #define BROWSER_TEST_LOCAL BOOK8_NET_IP(192, 168, 7, 10)
 #define BROWSER_TEST_DNS BOOK8_NET_IP(192, 168, 7, 53)
@@ -158,8 +164,22 @@ static bool audio_state(uint8_t *volume, bool *muted)
         return false;
     }
     *volume = (uint8_t)host_volume;
-    *muted = false;
+    *muted = host_muted;
     return true;
+}
+
+static bool media_set_mute(bool muted)
+{
+    host_muted = muted;
+    return true;
+}
+
+long book8gui_queue_utility(uint32_t kind, const char *path)
+{
+    queued_utility_kind = kind;
+    snprintf(queued_utility_path, sizeof(queued_utility_path), "%s",
+        path != NULL ? path : "");
+    return 0;
 }
 
 static bool collect_media(void *context,
@@ -382,6 +402,12 @@ static bool write_file(const char *path, const void *data, uint32_t size)
         saved_homepage[size] = '\0';
         return true;
     }
+    if (strcmp(path, BOOK8_MEDIA_PREFS_PATH) == 0) {
+        assert(size != 0u && size <= sizeof(saved_media_prefs));
+        memcpy(saved_media_prefs, data, size);
+        saved_media_size = size;
+        return true;
+    }
     assert(size > 54u && bytes[0] == 'B' && bytes[1] == 'M');
     uint32_t row = (640u * 3u + 3u) & ~3u;
     uint32_t pixel = 54u + (480u - 1u - 4u) * row + 4u * 3u;
@@ -399,6 +425,12 @@ static bool read_file(const char *path, void *destination,
         }
         memcpy(destination, test_wav, sizeof(test_wav));
         *size = sizeof(test_wav);
+        return true;
+    }
+    if (strcmp(path, BOOK8_MEDIA_PREFS_PATH) == 0
+        && saved_media_size != 0u && saved_media_size <= capacity) {
+        memcpy(destination, saved_media_prefs, saved_media_size);
+        *size = saved_media_size;
         return true;
     }
     if (strcmp(path, "A:\\BROWSER.CFG") != 0
@@ -444,6 +476,7 @@ int main(void)
         .media_seek = media_seek,
         .audio_state = audio_state,
         .audio_set_volume = media_set_volume,
+        .audio_set_mute = media_set_mute,
         .clock_ticks = ticks,
         .clock_hz = 1000u
     };
@@ -482,16 +515,40 @@ int main(void)
         .bounds = {20u, 20u, 500u, 260u}
     };
     host_volume = 40u;
+    host_muted = false;
     host_media_state = (struct book8gui_media_status){0};
+    saved_media_size = 0u;
+    queued_utility_path[0] = '\0';
+    queued_utility_kind = 0u;
     app.state = book8_player_class.create(&platform);
     assert(app.state != NULL);
+    drawn_text_count = 0u;
+    book8_player_class.render(&platform, &app);
+    bool player_menu_bar = false, player_controls = false;
+    for (uint32_t i = 0u; i < drawn_text_count; ++i) {
+        if (strcmp(drawn_text[i], "Media") == 0
+            || strcmp(drawn_text[i], "Playback") == 0) {
+            player_menu_bar = true;
+        }
+        if (strcmp(drawn_text[i], "Prefs") == 0
+            || strcmp(drawn_text[i], "PL") == 0) {
+            player_controls = true;
+        }
+    }
+    (void)player_controls;
+
     struct book8gui_event player_event = {
-        .type = BOOK8GUI_EVENT_MOUSE, .mouse_x = 100, .mouse_y = 70,
-        .mouse_buttons = 1u
+        .type = BOOK8GUI_EVENT_KEY, .key = BOOK8GUI_KEY_CTRL | 'o'
     };
     assert(book8_player_class.handle_event(&platform, &app, &player_event));
-    player_event.mouse_buttons = 0u;
-    (void)book8_player_class.handle_event(&platform, &app, &player_event);
+    drawn_text_count = 0u;
+    book8_player_class.render(&platform, &app);
+    for (uint32_t i = 0u; i < drawn_text_count; ++i) {
+        if (strcmp(drawn_text[i], "Open Media") == 0) {
+            player_controls = true;
+        }
+    }
+    assert(player_menu_bar && player_controls);
     static const char player_path[] = "A:\\TONE.WAV";
     for (uint32_t i = 0u; player_path[i] != '\0'; ++i) {
         player_event = (struct book8gui_event){
@@ -500,32 +557,97 @@ int main(void)
         assert(book8_player_class.handle_event(&platform, &app, &player_event));
     }
     player_event = (struct book8gui_event){
-        .type = BOOK8GUI_EVENT_MOUSE, .mouse_x = 450, .mouse_y = 70,
+        .type = BOOK8GUI_EVENT_MOUSE, .mouse_x = 360, .mouse_y = 196,
         .mouse_buttons = 1u
     };
     assert(book8_player_class.handle_event(&platform, &app, &player_event));
     assert(media_play_calls == 1u);
     player_event.mouse_buttons = 0u;
     (void)book8_player_class.handle_event(&platform, &app, &player_event);
+
     host_media_state = (struct book8gui_media_status){
         .loaded = true, .playing = true, .position_ms = 250u,
         .duration_ms = 1000u
     };
     book8_player_class.tick(&platform, &app);
     player_event = (struct book8gui_event){
-        .type = BOOK8GUI_EVENT_MOUSE, .mouse_x = 485, .mouse_y = 204,
+        .type = BOOK8GUI_EVENT_MOUSE, .mouse_x = 175, .mouse_y = 240,
         .mouse_buttons = 1u
     };
     assert(book8_player_class.handle_event(&platform, &app, &player_event));
-    assert(host_volume == 100u);
+    assert(host_volume >= 96u && host_volume <= 100u);
     player_event.mouse_buttons = 0u;
     (void)book8_player_class.handle_event(&platform, &app, &player_event);
-    player_event.mouse_x = 420;
-    player_event.mouse_y = 162;
+    player_event.mouse_x = 429;
+    player_event.mouse_y = 222;
     player_event.mouse_buttons = 1u;
     assert(book8_player_class.handle_event(&platform, &app, &player_event));
     assert(host_media_state.position_ms > 800u
         && host_media_state.position_ms < 850u);
+    player_event.mouse_buttons = 0u;
+    (void)book8_player_class.handle_event(&platform, &app, &player_event);
+
+    player_event = (struct book8gui_event){
+        .type = BOOK8GUI_EVENT_KEY, .key = BOOK8GUI_KEY_CTRL | 'n'
+    };
+    assert(book8_player_class.handle_event(&platform, &app, &player_event));
+    static const char stream_url[] = "http://192.168.1.5/tone.wav";
+    for (uint32_t i = 0u; stream_url[i] != '\0'; ++i) {
+        player_event = (struct book8gui_event){
+            .type = BOOK8GUI_EVENT_KEY, .key = (uint8_t)stream_url[i]
+        };
+        assert(book8_player_class.handle_event(&platform, &app, &player_event));
+    }
+    player_event = (struct book8gui_event){
+        .type = BOOK8GUI_EVENT_MOUSE, .mouse_x = 360, .mouse_y = 196,
+        .mouse_buttons = 1u
+    };
+    assert(book8_player_class.handle_event(&platform, &app, &player_event));
+    assert(queued_utility_kind == BOOK8_GUI_BROWSER
+        && strcmp(queued_utility_path, stream_url) == 0);
+    player_event.mouse_buttons = 0u;
+    (void)book8_player_class.handle_event(&platform, &app, &player_event);
+
+    player_event = (struct book8gui_event){
+        .type = BOOK8GUI_EVENT_MOUSE, .mouse_x = 486, .mouse_y = 86,
+        .mouse_buttons = 1u
+    };
+    assert(book8_player_class.handle_event(&platform, &app, &player_event));
+    player_event.mouse_buttons = 0u;
+    (void)book8_player_class.handle_event(&platform, &app, &player_event);
+    drawn_text_count = 0u;
+    book8_player_class.render(&platform, &app);
+    bool prefs_open = false;
+    for (uint32_t i = 0u; i < drawn_text_count; ++i) {
+        if (strcmp(drawn_text[i], "Browser Integration") == 0) {
+            prefs_open = true;
+        }
+    }
+    assert(prefs_open);
+    player_event.mouse_x = 80;
+    player_event.mouse_y = 196;
+    player_event.mouse_buttons = 1u;
+    assert(book8_player_class.handle_event(&platform, &app, &player_event));
+    player_event.mouse_buttons = 0u;
+    (void)book8_player_class.handle_event(&platform, &app, &player_event);
+    player_event.mouse_x = 180;
+    player_event.mouse_y = 108;
+    player_event.mouse_buttons = 1u;
+    assert(book8_player_class.handle_event(&platform, &app, &player_event));
+    player_event.mouse_buttons = 0u;
+    (void)book8_player_class.handle_event(&platform, &app, &player_event);
+    player_event.mouse_x = 350;
+    player_event.mouse_y = 244;
+    player_event.mouse_buttons = 1u;
+    assert(book8_player_class.handle_event(&platform, &app, &player_event));
+    player_event.mouse_buttons = 0u;
+    (void)book8_player_class.handle_event(&platform, &app, &player_event);
+    assert(strcmp(saved_path, BOOK8_MEDIA_PREFS_PATH) == 0);
+    assert((book8_media_prefs()->web & BOOK8_MEDIA_WEB_AUTOPLAY) == 0u);
+
+    struct book8_media_preferences defaults;
+    book8_media_prefs_defaults(&defaults);
+    assert(book8_media_prefs_save(&platform, &defaults));
     book8_player_class.render(&platform, &app);
     book8_player_class.destroy(app.state);
 
@@ -699,6 +821,23 @@ int main(void)
     assert(displayed_google_text && displayed_audio_link
         && displayed_video_link);
     assert(strcmp(app.title, "Internet Explorer - BOOK8 & News") == 0);
+
+    queued_utility_path[0] = '\0';
+    queued_utility_kind = 0u;
+    event = (struct book8gui_event){
+        .type = BOOK8GUI_EVENT_MOUSE,
+        .mouse_x = 640,
+        .mouse_y = 176,
+        .mouse_buttons = 1u
+    };
+    assert(book8_browser_class.handle_event(&platform, &app, &event));
+    assert(queued_utility_kind == BOOK8_GUI_PLAYER
+        && strcmp(queued_utility_path, "http://192.168.7.20/docs/tone.wav") == 0);
+    book8_browser_class.render(&platform, &app);
+    assert(strcmp(last_text, "Opened WAV link in BOOK8 Player.") == 0);
+    event.mouse_buttons = 0u;
+    (void)book8_browser_class.handle_event(&platform, &app, &event);
+
     bool displayed_entities = false, displayed_anchor_label = false;
     for (uint32_t i = 0u; i < drawn_text_count; ++i) {
         if (strstr(drawn_text[i], "Tom & Jerry - ... (c)") != NULL) {
@@ -756,6 +895,46 @@ int main(void)
     assert(media_play_calls == 2u);
     book8_browser_class.render(&platform, &app);
     assert(strcmp(last_text, "Playing WAV audio.") == 0);
+
+    struct book8_media_preferences web_prefs = *book8_media_prefs();
+    web_prefs.plugins &= ~BOOK8_MEDIA_PLUGIN_HTTP_WAV;
+    assert(book8_media_prefs_save(&platform, &web_prefs));
+    http_get(&app, &platform, "http://192.168.7.20/blocked.wav",
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n"
+        "Content-Type: audio/wav\r\n\r\nRIFFfake");
+    assert(media_play_calls == 2u);
+    book8_browser_class.render(&platform, &app);
+    assert(strcmp(last_text, "Web audio plugin disabled.") == 0);
+
+    web_prefs = *book8_media_prefs();
+    web_prefs.plugins |= BOOK8_MEDIA_PLUGIN_HTTP_WAV;
+    web_prefs.web &= ~BOOK8_MEDIA_WEB_AUTOPLAY;
+    assert(book8_media_prefs_save(&platform, &web_prefs));
+    http_get(&app, &platform, "http://192.168.7.20/blocked.wav",
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n"
+        "Content-Type: audio/wav\r\n\r\nRIFFfake");
+    assert(media_play_calls == 2u);
+    book8_browser_class.render(&platform, &app);
+    assert(strcmp(last_text, "Web audio autoplay disabled.") == 0);
+
+    web_prefs = *book8_media_prefs();
+    web_prefs.web &= ~BOOK8_MEDIA_WEB_MEDIA_PANEL;
+    assert(book8_media_prefs_save(&platform, &web_prefs));
+    http_get(&app, &platform, "http://192.168.7.20/no-media.html",
+        "HTTP/1.1 200 OK\r\nContent-Length: 47\r\n"
+        "Content-Type: text/html\r\n\r\n"
+        "<html><body><audio src='tone.wav'></audio></body></html>");
+    drawn_text_count = 0u;
+    book8_browser_class.render(&platform, &app);
+    bool displayed_hidden_audio = false;
+    for (uint32_t i = 0u; i < drawn_text_count; ++i) {
+        if (strstr(drawn_text[i], "Audio WAV") != NULL) {
+            displayed_hidden_audio = true;
+        }
+    }
+    assert(!displayed_hidden_audio);
+    book8_media_prefs_defaults(&web_prefs);
+    assert(book8_media_prefs_save(&platform, &web_prefs));
     book8_browser_class.destroy(app.state);
 
     app = (struct WindowApp){

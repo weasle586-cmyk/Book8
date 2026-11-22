@@ -167,7 +167,7 @@ def main():
             monitor.command("mouse_button 2", 0.15)
             monitor.command("mouse_button 0", 0.15)
             monitor.click(100, 246)
-            monitor.click(100, 138)
+            monitor.click(100, 156)
             smoke.wait_for(serial, process, 'title="Code Editor" registered', occurrences=3)
             code_x = min(88, width - window_width)
             monitor.click(code_x + window_width - 14, 100)

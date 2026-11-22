@@ -30,6 +30,7 @@
 #define BOOK8_GUI_PAINTBOOK 4u
 #define BOOK8_GUI_BROWSER 5u
 #define BOOK8_GUI_NVDIAG 6u
+#define BOOK8_GUI_PLAYER 7u
 
 #define BOOK8_EPERM    1
 #define BOOK8_ENOENT   2

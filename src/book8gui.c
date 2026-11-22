@@ -173,7 +173,8 @@ static const char *utility_path(uint32_t kind)
         : kind == BOOK8_GUI_NETSHARE ? "A:\\BIN\\NETSHARE.ELF"
         : kind == BOOK8_GUI_PAINTBOOK ? "A:\\BIN\\PAINTBK.ELF"
         : kind == BOOK8_GUI_BROWSER ? "A:\\BIN\\BROWSER.ELF"
-        : kind == BOOK8_GUI_NVDIAG ? "A:\\BIN\\NVDIAG.ELF" : NULL;
+        : kind == BOOK8_GUI_NVDIAG ? "A:\\BIN\\NVDIAG.ELF"
+        : kind == BOOK8_GUI_PLAYER ? "A:\\BIN\\PLAYER.ELF" : NULL;
 }
 
 long book8gui_queue_utility(uint32_t kind, const char *path)
@@ -221,7 +222,8 @@ bool book8gui_open_pending_utility(void)
         ? &book8_codeedit_class : kind == BOOK8_GUI_NETSHARE
         ? &book8_netshare_class : kind == BOOK8_GUI_PAINTBOOK
         ? &book8_paintbook_class : kind == BOOK8_GUI_BROWSER
-        ? &book8_browser_class : &book8_nvdiag_class;
+        ? &book8_browser_class : kind == BOOK8_GUI_NVDIAG
+        ? &book8_nvdiag_class : &book8_player_class;
     struct WindowApp *app = book8gui_launch_class(cls);
     if (app == NULL) { program_report("Utility window limit reached."); return false; }
     if (pending_utility.path[0] != '\0') {
@@ -399,6 +401,8 @@ static bool scan_program(const char *name, bool directory, uint32_t size,
         snprintf(entry->name, sizeof(entry->name), "PaintBook");
     } else if (path_equal(path, utility_path(BOOK8_GUI_BROWSER))) {
         snprintf(entry->name, sizeof(entry->name), "Web Browser");
+    } else if (path_equal(path, utility_path(BOOK8_GUI_PLAYER))) {
+        snprintf(entry->name, sizeof(entry->name), "BOOK8 Player");
     } else if (path_equal(path, utility_path(BOOK8_GUI_NVDIAG))) {
         snprintf(entry->name, sizeof(entry->name), "NV Diagnostic");
     } else if (path_equal(name, "EXPLORER.ELF")) {
@@ -666,6 +670,7 @@ bool book8gui_remove_program(const char *path)
                 || (path_equal(path, utility_path(BOOK8_GUI_NETSHARE)) && cls == &book8_netshare_class)
                 || (path_equal(path, utility_path(BOOK8_GUI_PAINTBOOK)) && cls == &book8_paintbook_class)
                 || (path_equal(path, utility_path(BOOK8_GUI_BROWSER)) && cls == &book8_browser_class)
+                || (path_equal(path, utility_path(BOOK8_GUI_PLAYER)) && cls == &book8_player_class)
                 || (path_equal(path, utility_path(BOOK8_GUI_NVDIAG)) && cls == &book8_nvdiag_class)) {
                 program_report("Close this utility's windows before removing its executable.");
                 return false;

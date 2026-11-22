@@ -259,7 +259,8 @@ static long sys_gui_utility_handler(uint64_t data, uint64_t size, uint64_t a3,
         && request.kind != BOOK8_GUI_NETSHARE
         && request.kind != BOOK8_GUI_PAINTBOOK
         && request.kind != BOOK8_GUI_BROWSER
-        && request.kind != BOOK8_GUI_NVDIAG) {
+        && request.kind != BOOK8_GUI_NVDIAG
+        && request.kind != BOOK8_GUI_PLAYER) {
         return -BOOK8_EINVAL;
     }
     uint32_t n = 0u;

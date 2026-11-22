@@ -209,7 +209,7 @@ static bool event(struct book8gui_event *e)
             && book8gui_utility_installed(3u) && book8gui_utility_installed(4u)
             && book8gui_utility_installed(5u)
             && book8gui_utility_installed(BOOK8_GUI_NVDIAG));
-        assert(book8gui_file_app(3u) == &book8_paintbook_class);
+        assert(book8gui_file_app(4u) == &book8_paintbook_class);
         assert(strstr(book8gui_program_status(), "metadata unavailable: 1"));
         assert(strstr(book8gui_program_status(), "unreadable drives skipped: 1"));
         settings_app = book8gui_launch_class(&book8_settings_class);

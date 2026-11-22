@@ -6,6 +6,7 @@
 #include "../src/mouse_input.h"
 #include "../src/apps/book8_ui.h"
 #include "../src/apps/book8_editor.h"
+#include "../src/apps/book8_player.h"
 #include "../src/apps/book8_settings.h"
 #include "../src/apps/book8_utilities.h"
 #include "../src/registry.h"
@@ -308,7 +309,7 @@ static bool poll_event(struct book8gui_event *event)
     if (utility_scenario && event_index == 1u) {
         assert(book8gui_remove_program("A:\\BIN\\HEXVIEW.ELF"));
         assert(!book8gui_utility_installed(BOOK8_GUI_HEXVIEW));
-        assert(book8gui_file_app(1u) == NULL);
+        assert(book8gui_file_app(2u) == NULL);
     }
     if (programs_scenario && !utility_scenario && event_index == 0u) {
         assert(book8gui_program_count() == 8u);
@@ -950,7 +951,9 @@ int main(void)
     add_click(40, 310, &ticks);
     add_click(200, 310, &ticks);
     if (!book8gui_run(&platform) || !saw_maximized_bounds || editor_reads != 1u
-        || book8gui_file_app(0u) == NULL || book8gui_file_app(1u) != NULL) {
+        || book8gui_file_app(0u) == NULL
+        || book8gui_file_app(1u) != &book8_player_class
+        || book8gui_file_app(2u) != NULL) {
         fprintf(stderr, "FAIL: maximize bounds or Open With registry\n%s\n", trace);
         return 1;
     }
@@ -1130,7 +1133,7 @@ int main(void)
     removed_hex = false;
     assert(book8gui_refresh_programs());
     assert(book8gui_utility_installed(BOOK8_GUI_HEXVIEW));
-    assert(book8gui_file_app(1u) == &book8_hexview_class);
+    assert(book8gui_file_app(2u) == &book8_hexview_class);
     assert(book8gui_queue_utility(99u, "") == -BOOK8_EINVAL);
     assert(book8gui_queue_utility(BOOK8_GUI_HEXVIEW, NULL) == -BOOK8_EINVAL);
     char overlong_path[257];
@@ -1148,7 +1151,7 @@ int main(void)
     add_click(200, 310, &ticks);
     assert(book8gui_run(&platform));
     assert(!book8gui_utility_installed(BOOK8_GUI_HEXVIEW));
-    assert(book8gui_file_app(1u) == NULL);
+    assert(book8gui_file_app(2u) == NULL);
     utility_scenario = false;
     programs_scenario = false;
     printf("book8gui host test: PASS\n");
