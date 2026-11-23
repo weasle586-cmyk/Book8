@@ -11,6 +11,7 @@ from pathlib import Path
 
 import qemu_control_panel_test as panel
 import qemu_graphics_input_smoke as smoke
+import ui_geometry as geo
 from qemu_desktop_test import QemuMonitor
 from qemu_utilities_test import screenshot_region
 
@@ -78,40 +79,54 @@ def main():
             monitor = QemuMonitor(port, process)
             monitor.set_screen_size(width, height)
             monitor.reset_pointer()
-            bottom = height - 36
-            visible = (bottom - 6) // 20
-            menu_y = bottom - 2 - (visible * 20 + 4)
-            utility_y = menu_y + 2 + 4 * 20
+            # Frozen in tests/ui_geometry.py; only row identity is dynamic.
+            bottom = height - geo.TASKBAR_HEIGHT
+            visible = geo.menu_capacity(height)
+            menu_y = geo.panel_top(height, visible)
+            utility_y = menu_y + geo.MENU_PANEL_PADDING + 4 * geo.MENU_ROW_HEIGHT
             titles = ("Hex Sector Viewer", "Code Editor", "Local Network Share Browser")
             sizes = (680, 640, 720)
             for index, (title, preferred_width) in enumerate(zip(titles, sizes)):
-                monitor.click(20, height - 18)
-                monitor.click(40, height - 90)
-                monitor.click(200, utility_y + 10 + index * 20)
+                monitor.click(geo.TASKBAR_START_X,
+                              height - geo.TASKBAR_START_Y_OFFSET)
+                monitor.click(geo.PROGRAMS_MENU_X,
+                              height - geo.PROGRAMS_MENU_Y_OFFSET)
+                monitor.click(geo.PROGRAM_CLICK_X,
+                              utility_y + geo.MENU_ROW_CENTER
+                              + index * geo.MENU_ROW_HEIGHT)
                 smoke.wait_for(serial, process, f'title="{title}" registered')
                 window_width = min(preferred_width, width - 8)
                 x = min(40 + index * 24, width - window_width)
                 monitor.click(x + window_width - 14, 52 + index * 24)
                 smoke.wait_for(serial, process, f"WINDOW closed id={index + 1}")
-            monitor.click(20, height - 18)
-            monitor.click(40, height - 90)
-            monitor.click(200, menu_y + 2 + 7 * 20 + 10)
+            monitor.click(geo.TASKBAR_START_X, height - geo.TASKBAR_START_Y_OFFSET)
+            monitor.click(geo.PROGRAMS_MENU_X, height - geo.PROGRAMS_MENU_Y_OFFSET)
+            monitor.click(geo.PROGRAM_CLICK_X,
+                          menu_y + geo.MENU_PANEL_PADDING + 7 * geo.MENU_ROW_HEIGHT
+                          + geo.MENU_ROW_CENTER)
             smoke.wait_for(serial, process, "CAT: execve hello")
             smoke.wait_for(serial, process, "EXEC: A:\\CAT.ELF exited with status 7")
-            monitor.click(20, height - 18)
-            monitor.click(40, height - 90)
-            screenshot_region(monitor, logs / "menu-expanded.ppm", 152, menu_y, 224,
-                              visible * 20 + 4)
-            monitor.move_to(365, menu_y + 3)
+            monitor.click(geo.TASKBAR_START_X, height - geo.TASKBAR_START_Y_OFFSET)
+            monitor.click(geo.PROGRAMS_MENU_X, height - geo.PROGRAMS_MENU_Y_OFFSET)
+            panel_x = geo.MENU_X + geo.MENU_WIDTH - 2
+            panel_pixels = visible * geo.MENU_ROW_HEIGHT + geo.MENU_PANEL_BORDER
+            screenshot_region(monitor, logs / "menu-expanded.ppm", panel_x, menu_y,
+                              geo.SUBMENU_WIDTH, panel_pixels)
+            monitor.move_to(panel_x + geo.SUBMENU_WIDTH - 11,
+                            menu_y + geo.MENU_PANEL_PADDING + 1)
             monitor.command("mouse_button 1", 0.2)
             monitor.move_to(430, bottom - 4)
             monitor.command("mouse_button 0", 0.2)
-            screenshot_region(monitor, logs / "menu-bottom.ppm", 152, menu_y, 224,
-                              visible * 20 + 4)
-            monitor.click(200, menu_y + 2 + (visible - 1) * 20 + 10)
+            screenshot_region(monitor, logs / "menu-bottom.ppm", panel_x, menu_y,
+                              geo.SUBMENU_WIDTH, panel_pixels)
+            monitor.click(geo.PROGRAM_CLICK_X,
+                          menu_y + geo.MENU_PANEL_PADDING
+                          + (visible - 1) * geo.MENU_ROW_HEIGHT
+                          + geo.MENU_ROW_CENTER)
             smoke.wait_for(serial, process, f"EXEC: {deep_binary} exited with status 7")
-            monitor.click(20, height - 18)
-            monitor.click(40, height - 70)
+            monitor.click(geo.TASKBAR_START_X, height - geo.TASKBAR_START_Y_OFFSET)
+            monitor.click(geo.PROGRAMS_MENU_X,
+                          geo.root_row_y(height, 1))
             smoke.wait_for(serial, process, 'title="System Settings" registered')
             settings_width = min(620, width - 8)
             x = min(112, width - settings_width)
@@ -123,7 +138,7 @@ def main():
             content_width = width - 8 - 148
             list_width = content_width // 2
             list_x, list_y = 152, 30
-            list_height = height - 36 - 34 - 54
+            list_height = height - geo.TASKBAR_HEIGHT - 34 - 54
             track_x = list_x + list_width - 13
             before = screenshot_region(monitor, logs / "list-before.ppm",
                                        list_x + 4, list_y + 6, 144, 16)

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import qemu_control_panel_test as panel
 import qemu_graphics_input_smoke as smoke
+import qemu_ui_lookup as ui
 from qemu_desktop_test import QemuMonitor
 from qemu_utilities_test import screenshot_region, type_text
 
@@ -59,10 +60,10 @@ def main():
                                "BOOK8-SESSION: login accepted uid=0")
                 # A:\HELLO.ELF is indexed too.  The external test disk is
                 # reported unreadable and contributes no programs.
-                count = 14
-                expected = f"Programs indexed: {count}; metadata unavailable: 0; invalid names skipped: 0; unreadable drives skipped: {int(attached)}."
+                expected = "Programs indexed: 14; metadata unavailable: 0; invalid names skipped: 0; unreadable drives skipped: %d." % int(attached)
                 smoke.wait_for(serial, process, expected)
-                menu_y = height - 36 - 2 - (count * 20 + 4)
+                rows = ui.await_program_rows(serial, process)
+                menu_y = ui.panel_top(height, len(rows))
                 monitor.click(20, height - 18)
                 monitor.click(40, height - 90)
                 pixels = screenshot_region(monitor, logs / f"{name}-menu.ppm",
@@ -72,18 +73,20 @@ def main():
                                          for row in range(8)))
                 if not attached:
                     continue
-                paths = ((7, "A:\\BIN\\HEXVIEW.ELF"),
-                         (3, "A:\\BIN\\CODEEDIT.ELF"),
-                         (8, "A:\\BIN\\NETSHARE.ELF"),
-                         (2, "A:\\CAT.ELF"))
+                paths = ("A:\\BIN\\HEXVIEW.ELF", "A:\\BIN\\CODEEDIT.ELF",
+                         "A:\\BIN\\NETSHARE.ELF", "A:\\CAT.ELF")
                 titles = ("Hex Sector Viewer", "Code Editor",
                           "Local Network Share Browser")
                 preferred_widths = (680, 640, 720)
-                for index, (row, path) in enumerate(paths):
-                    if index != 0:
-                        monitor.click(20, height - 18)
-                        monitor.click(40, height - 90)
-                    monitor.click(200, menu_y + 2 + row * 20 + 10)
+                for index, path in enumerate(paths):
+                    if index == 0:
+                        # The Programs submenu is still open from the screenshot
+                        # above; clicking Start again would close it.
+                        monitor.click(200, ui.row_y(
+                            height, ui.resolve_row(serial, path=path), len(rows)))
+                    else:
+                        ui.click_program(monitor, serial, height, process=process,
+                                         path=path)
                     if index < 3:
                         smoke.wait_for(serial, process, f'title="{titles[index]}" registered')
                         window_width = min(preferred_widths[index], width - 8)
@@ -94,22 +97,20 @@ def main():
                         smoke.wait_for(serial, process, f"WINDOW closed id={index + 2}")
                     else:
                         smoke.wait_for(serial, process, f"EXEC: {path} exited with status 7")
-                monitor.click(20, height - 18)
-                monitor.click(40, height - 90)
-                monitor.click(200, menu_y + 2 + 6 * 20 + 10)
+                ui.click_program(monitor, serial, height, process=process,
+                                 path="A:\\HELLO.ELF")
                 smoke.wait_for(serial, process, "EXEC: A:\\HELLO.ELF exited with status 7")
                 smoke.wait_for(serial, process, "HELLO: argv[0]=A:\\HELLO.ELF")
-                builtins = ((5, "File Explorer", 300, 300),
-                            (4, "Command Shell", 300, 300),
-                            (9, "NoteEditor", 560, 360),
-                            (12, "Task Manager", 560, 360))
+                builtins = (("File Explorer", 300, 300),
+                            ("Command Shell", 300, 300),
+                            ("NoteEditor", 560, 360),
+                            ("Task Manager", 560, 360))
                 # launch_count includes the sign-in window and the three utility
                 # windows above, so these cascade steps are 4, 5, 0 and 1 mod 6.
                 builtin_steps = (96, 120, 0, 24)
-                for order, (row, title, preferred_width, preferred_height) in enumerate(builtins):
-                    monitor.click(20, height - 18)
-                    monitor.click(40, height - 90)
-                    monitor.click(200, menu_y + 2 + row * 20 + 10)
+                for order, (title, preferred_width, preferred_height) in enumerate(builtins):
+                    ui.click_program(monitor, serial, height, process=process,
+                                     label=title)
                     window_id = order + 5
                     smoke.wait_for(serial, process,
                                    f'WINDOW id={window_id} title="{title}" registered')
@@ -136,13 +137,12 @@ def main():
                 screenshot_region(monitor, logs / f"{name}-programs.ppm", 160, 50, 440, 290)
                 # System Settings consumed launch step 8; these are steps 9-11.
                 trailing_steps = (72, 96, 120)
-                for order, (row, title, preferred_width, preferred_height) in enumerate((
-                        (11, "PaintBook", 760, 520),
-                        (13, "Web Browser", 820, 560),
-                        (10, "NV Diagnostic", 700, 480))):
-                    monitor.click(20, height - 18)
-                    monitor.click(40, height - 90)
-                    monitor.click(200, menu_y + 2 + row * 20 + 10)
+                for order, (title, preferred_width, preferred_height) in enumerate((
+                        ("PaintBook", 760, 520),
+                        ("Web Browser", 820, 560),
+                        ("NV Diagnostic", 700, 480))):
+                    ui.click_program(monitor, serial, height, process=process,
+                                     label=title)
                     window_id = {"PaintBook": 10, "Web Browser": 11,
                                  "NV Diagnostic": 12}[title]
                     smoke.wait_for(serial, process,
@@ -154,9 +154,8 @@ def main():
                     y = min(40 + step, height - 36 - window_height)
                     monitor.click(x + window_width - 14, y + 12)
                     smoke.wait_for(serial, process, f"WINDOW closed id={window_id}")
-                monitor.click(20, height - 18)
-                monitor.click(40, height - 90)
-                monitor.click(200, menu_y + 2 + 1 * 20 + 10)
+                ui.click_program(monitor, serial, height, process=process,
+                                 label="BOOK8 Player")
                 smoke.wait_for(serial, process,
                                'WINDOW id=13 title="BOOK8 Player" registered')
                 monitor.click(40 + 500 - 14, 40 + 12)

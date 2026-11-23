@@ -1,19 +1,81 @@
-Fix BAR1 SPT layout and teardown zero ranges.X
+Driver inventory
+Area	Current state	Maturity
+drivers/pcie.c, amd_host_bridge.c, rs780*	ECAM/legacy config, RS780 LTSSM L0 verification, read-only diagnostics, manual single-index audit API	Mature but intentionally conservative
+drivers/rtl8168*	DMA rings, non-blocking TX, backpressure, telemetry path	Mature, well-tested
+drivers/hda*	PCI routing, stream/DMA, WAV playback	Mature, well-tested
+drivers/ata_dma, ahci	ATA DMA, AHCI, host tests	Mature
+drivers/usb_host_module.c	Module entry, limited host support	Partial
+drivers/nv_maxwell*	BAR mapping, PTOP CE discovery, PFIFO channel bind, CE fill/copy self-test, optional acceleration	Experimental, opt-in, bare-metal only
+NV Maxwell: main improvement opportunities
+On-hardware validation is still the gating item
+PRAMIN window behavior, BAR1 bind/unbind, PFIFO enable, PBDMA NOP ring ack, fence timing, and scan-out PTE verification are all unverified on real GM204 hardware.
+The current code already has good diagnostics; the next phase should make a structured bring-up checklist and collect BOOK8-NV: telemetry from a real GTX 970/980.
+Channel lifecycle and recovery
+nv_accel_ready() latches accel_failed permanently after a fence timeout.
+Add channel reset/rebind recovery, or at least a documented “disable acceleration and retain CPU fallback” path.
+Add teardown tests for runlist emptying, BAR1 restore, PMC restore, and VRAM structure zeroing.
+Command batching
+Every fill/copy currently does its own reserve/submit/fence.
+Batch multiple GUI rectangles into one pushbuffer submission and one fence to reduce latency.
+Keep the existing CPU fallback for small rectangles via NV_ACCEL_DEFAULT_MIN_PIXELS.
+Copy-engine robustness
+Same-row overlapping copies are currently unsupported.
+Improve the banded memmove path or add a small temporary buffer path for same-row overlap.
+Expand the self-test to cover more alignments, larger rectangles, multiple fill colors, and repeated copy chains.
+Validate NV_ACCEL_MAX_BANDS behavior on hardware.
+BAR1 and VRAM assumptions
+BAR1 is treated as an identity map.
+Add detection/reporting for non-identity firmware BAR1 mappings and refuse bind in that case.
+Verify scan-out surface placement below the 256 MiB identity map.
+Consider supporting a larger or dynamically sized BAR1 aperture.
+CE discovery and multi-engine support
+PTOP parsing currently focuses on one graphics and one copy engine.
+Support multiple CE instances/runlists and choose one with enough capacity.
+Add diagnostics for engine/runlist selection.
+Display and graphics-engine scope
+NV902D 2D requires signed FECS/GPCCS firmware, which is unavailable.
+Display modesetting is not implemented.
+Recommended next scope: keep CE-based copy/fill acceleration only; do not pursue NV902D or modesetting until firmware licensing and display-controller documentation are resolved.
+Driver security and ABI
+Deferred ELF hash verification in the Multiboot2 boot path should be completed before trusting loadable driver modules.
+Add module ABI/version checks and signed-module policy.
+Keep opt-in channel binding (BOOK8_NV_BIND_CHANNEL=0) as the default until hardware validation passes.
+Testing
+Expand tests/nv_maxwell_host_test.c to simulate:
+multiple CE/runlists,
+non-identity BAR1,
+fence timeout and recovery,
+stuck PCI command,
+BAR unmap accounting,
+partial bind failure and unwind.
+Add a software-emulated PCI/GPU test harness or a host-side fake Maxwell device so CI can exercise more than register sequencing.
+Add CPU-vs-GPU performance comparisons for window moves/scrolling.
+Other drivers
+RTL8168/HDA are comparatively mature; next work there should focus on interrupt-driven servicing, power management, and hotplug rather than core protocol correctness.
+USB host support needs expansion before it can match the storage/network stack.
+PCIe/RS780 should remain read-only diagnostics; avoid lane/power-gating writes until hardware evidence exists.
+Proposed next phase
 
-Save/restore all PFIFO/runlist/interrupt/BAR1 USERD state.X
+Phase 1: NV bring-up validation
+Run on real GTX 970/980 hardware.
+Capture serial telemetry for BAR0/BAR1/PFB/PFIFO/PBDMA/runlist/fence.
+Validate each bind stage and document exact register values.
+No permanent acceleration enablement yet.
 
-Add unmap_mmio.X
+Phase 2: CE acceleration hardening
+Add recovery instead of permanent latch.
+Batch GUI operations.
+Improve overlap copy.
+Expand self-test.
+Keep CPU fallback as the default behavior.
 
-Fix multifunction probe and PCI command write.X
+Phase 3: Driver security and module trust
+Implement ELF hash verification in the boot path.
+Add module ABI/version enforcement.
+Define signed-module policy.
 
-Fix scratch clear size.X
-
-Rewrite tests/nv_maxwell_host_test.c for CE and add layout/restore regressions.X
-
-Expose acceleration stats through hwdiag/NVDIAG.X
-
-Add book8.nv.accel=off|auto|on; keep off/CPU default until a real GTX 970/980 run passes.
-
-Add NVTEST scratch-only fill/copy/scroll stress with serial output.
-
-Wire present into fb_present_rect() as a separate change after 1–9 are green.
+Phase 4: Broader driver maturity
+Interrupt-driven HDA/RTL8168 servicing.
+USB host expansion.
+Power management and hotplug design.
+Performance benchmarking against CPU rendering.

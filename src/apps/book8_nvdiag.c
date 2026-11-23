@@ -11,15 +11,20 @@
 #define NVDIAG_ROW_H 18u
 #define NVDIAG_STATUS_H 20u
 #define NVDIAG_REFRESH_W 68u
-#define NVDIAG_LINE_LEN 96u
-#define NVDIAG_MAX_LINES 20u
-#define NVDIAG_TAB_COUNT 6u
+#define NVDIAG_LINE_LEN 160u
+#define NVDIAG_MAX_LINES 64u
+#define NVDIAG_TAB_COUNT 8u
+
+_Static_assert(NVDIAG_TAB_COUNT == 8u,
+    "NV Diagnostic must expose exactly eight tabs");
 
 enum nvdiag_tab {
     NVDIAG_GPU,
     NVDIAG_FIFO,
     NVDIAG_BAR0,
     NVDIAG_MEMORY,
+    NVDIAG_HARDWARE,
+    NVDIAG_FIRMWARE_PLATFORM,
     NVDIAG_FIRMWARE,
     NVDIAG_ACCEL
 };
@@ -58,10 +63,12 @@ struct nvdiag_register {
 };
 
 static const char *const tab_names[NVDIAG_TAB_COUNT] = {
-    "GPU", "FIFO", "BAR0", "Memory", "Firmware", "Accel"
+    "GPU", "FIFO", "BAR0", "Memory", "Hardware",
+    "Firmware Platform", "Firmware", "Accel"
 };
+/* 8 px glyphs, 8 px left inset and a small right gutter per tab label. */
 static const uint32_t tab_widths[NVDIAG_TAB_COUNT] = {
-    70u, 70u, 70u, 82u, 86u, 72u
+    64u, 64u, 64u, 78u, 84u, 150u, 84u, 70u
 };
 static const struct nvdiag_register registers[] = {
     {"PMC_BOOT_0", 0x000000u, 0u},
@@ -124,6 +131,46 @@ static void add_line(struct nvdiag_line *lines, uint32_t *count,
     ++*count;
 }
 
+/* Wraps on word boundaries so long specification rows stay inside the pane. */
+static void add_wrapped_line(struct nvdiag_line *lines, uint32_t *count,
+    bool heading, const char *text, uint32_t wrap_cols)
+{
+    uint32_t limit = wrap_cols;
+    if (limit == 0u || limit >= NVDIAG_LINE_LEN - 1u) {
+        add_line(lines, count, heading, text);
+        return;
+    }
+    uint32_t start = 0u;
+    bool first_chunk = true;
+    while (text[start] != '\0') {
+        while (text[start] == ' ') {
+            ++start;
+        }
+        if (text[start] == '\0') {
+            break;
+        }
+        uint32_t end = start;
+        uint32_t last_space = start;
+        while (text[end] != '\0' && end - start < limit) {
+            if (text[end] == ' ') {
+                last_space = end;
+            }
+            ++end;
+        }
+        uint32_t split = text[end] == '\0' ? end
+            : (last_space > start ? last_space : end);
+        char chunk[NVDIAG_LINE_LEN];
+        uint32_t n = 0u;
+        for (uint32_t i = start; i < split && n + 1u < sizeof(chunk); ++i) {
+            chunk[n++] = text[i];
+        }
+        chunk[n] = '\0';
+        add_line(lines, count, heading && first_chunk, chunk);
+        first_chunk = false;
+        start = split;
+    }
+}
+
 static const char *device_name(uint32_t pci_id)
 {
     uint16_t device_id = (uint16_t)(pci_id >> 16u);
@@ -132,9 +179,32 @@ static const char *device_name(uint32_t pci_id)
         : "NVIDIA display adapter";
 }
 
-static void build_lines(enum nvdiag_tab tab,
-    const struct book8_nvdiag_snapshot *s, bool snapshot_ok,
-    struct nvdiag_line *lines, uint32_t *count)
+static const char *platform_state_text(uint8_t state)
+{
+    return state == BOOK8_PLATFORM_ON ? "detected/enabled"
+        : state == BOOK8_PLATFORM_OFF ? "not active" : "not reported";
+}
+
+static const char *platform_bool_text(uint8_t state)
+{
+    return state == BOOK8_PLATFORM_ON ? "yes"
+        : state == BOOK8_PLATFORM_OFF ? "no" : "unknown";
+}
+
+static uint32_t pcie_generation(uint32_t link_status)
+{
+    return link_status & 0xfu;
+}
+
+static uint32_t pcie_lanes(uint32_t link_status)
+{
+    return (link_status >> 4u) & 0x3fu;
+}
+
+static void build_lines(const struct book8gui_platform *platform,
+    enum nvdiag_tab tab, const struct book8_nvdiag_snapshot *s,
+    bool snapshot_ok, struct nvdiag_line *lines, uint32_t *count,
+    uint32_t wrap_cols)
 {
     char text[NVDIAG_LINE_LEN];
     *count = 0u;
@@ -188,9 +258,15 @@ static void build_lines(enum nvdiag_tab tab,
         } else if ((s->flags & BOOK8_NVDIAG_CHANNEL_BOUND) != 0u) {
             add_line(lines, count, false,
                 "PFIFO channel active; copy engine not verified.");
+        } else if ((s->flags & BOOK8_NVDIAG_MAPPED) == 0u) {
+            add_line(lines, count, false,
+                "2D acceleration unavailable; GPU registers not mapped.");
+        } else if ((s->flags & BOOK8_NVDIAG_CE_FOUND) != 0u) {
+            add_line(lines, count, false,
+                "Copy engine found but not verified; software rendering active.");
         } else {
             add_line(lines, count, false,
-                "2D acceleration unavailable; software rendering active.");
+                "2D acceleration unavailable; no channel bound.");
         }
         if ((s->flags & BOOK8_NVDIAG_SCANOUT_VALID) != 0u) {
             snprintf(text, sizeof(text), "Scanout: %ux%u, pitch %u bytes",
@@ -324,22 +400,246 @@ static void build_lines(enum nvdiag_tab tab,
             "Memory-controller telemetry: not implemented by this driver.");
         break;
 
-    case NVDIAG_FIRMWARE:
+    case NVDIAG_HARDWARE: {
+        struct book8_platform_info pi = {0};
+        struct book8gui_sysinfo si = {0};
+        bool have_pi = platform->platform_info != NULL
+            && platform->platform_info(&pi);
+        bool have_si = platform->system_info != NULL
+            && platform->system_info(&si);
+
+        add_wrapped_line(lines, count, true, "HARDWARE INVENTORY (live)",
+            wrap_cols);
+        snprintf(text, sizeof(text), "GPU: %s", device_name(s->pci_id));
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        if ((s->flags & BOOK8_NVDIAG_PCI_CONFIG) != 0u) {
+            snprintf(text, sizeof(text),
+                "PCI: %02x:%02x.%u  ID %08x  subsystem %04x:%04x",
+                (s->bdf >> 8u) & 0xffu, (s->bdf >> 3u) & 0x1fu,
+                s->bdf & 7u, s->pci_id,
+                s->subsystem_id >> 16u, s->subsystem_id & 0xffffu);
+            add_wrapped_line(lines, count, false, text, wrap_cols);
+        }
+        snprintf(text, sizeof(text), "BAR0: 0x%llx + %llu MiB",
+            (unsigned long long)s->bar0_phys,
+            (unsigned long long)(s->bar0_size / (1024u * 1024u)));
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        snprintf(text, sizeof(text), "BAR1: 0x%llx + %llu MiB",
+            (unsigned long long)s->bar1_phys,
+            (unsigned long long)(s->bar1_size / (1024u * 1024u)));
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        if (s->detected_vram_mb != 0u) {
+            snprintf(text, sizeof(text),
+                "VRAM from PFB_CSTATUS: %u MiB", s->detected_vram_mb);
+            add_wrapped_line(lines, count, false, text, wrap_cols);
+        } else {
+            add_wrapped_line(lines, count, false,
+                "VRAM: PFB_CSTATUS not sampled", wrap_cols);
+        }
+        snprintf(text, sizeof(text),
+            "Chipset 0x%03x, revision 0x%u, foundry 0x%u", s->chipset,
+            (unsigned)s->chip_revision, (unsigned)s->foundry_id);
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        if ((s->flags & BOOK8_NVDIAG_SCANOUT_VALID) != 0u) {
+            snprintf(text, sizeof(text),
+                "Display: %ux%u, pitch %u (boot scanout; EDID not read)",
+                s->scanout_width, s->scanout_height, s->scanout_pitch);
+        } else {
+            snprintf(text, sizeof(text), "%s",
+                "Display: no adopted scanout; EDID not read");
+        }
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        if ((s->flags & BOOK8_NVDIAG_PCI_EXPRESS) != 0u) {
+            snprintf(text, sizeof(text),
+                "GPU PCIe link: Gen%u x%u (max Gen%u x%u)",
+                (unsigned)pcie_generation(s->pcie_link_status),
+                (unsigned)pcie_lanes(s->pcie_link_status),
+                (unsigned)pcie_generation(s->pcie_link_cap),
+                (unsigned)pcie_lanes(s->pcie_link_cap));
+            add_wrapped_line(lines, count, false, text, wrap_cols);
+        }
+
+        if (have_si && si.cpu_name[0u] != '\0') {
+            snprintf(text, sizeof(text), "CPU: %.48s", si.cpu_name);
+            add_wrapped_line(lines, count, false, text, wrap_cols);
+            snprintf(text, sizeof(text),
+                "CPU ID: family %02xh model %02xh stepping %u; %u threads, %u MHz",
+                (unsigned)pi.cpu_family, (unsigned)pi.cpu_model_id,
+                (unsigned)pi.cpu_stepping, si.cpu_threads, si.cpu_mhz);
+        } else {
+            snprintf(text, sizeof(text), "%s",
+                "CPU: brand string unavailable (CPUID not supported)");
+        }
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        if (have_pi && (pi.flags & BOOK8_PLATFORM_SMBIOS_VALID) != 0u) {
+            snprintf(text, sizeof(text), "Motherboard: %s %s",
+                pi.board_vendor[0u] != '\0' ? pi.board_vendor : "unknown",
+                pi.board_product[0u] != '\0' ? pi.board_product : "unknown");
+            add_wrapped_line(lines, count, false, text, wrap_cols);
+            snprintf(text, sizeof(text), "BIOS: %s %s, released %s",
+                pi.bios_vendor[0u] != '\0' ? pi.bios_vendor : "unknown",
+                pi.bios_version[0u] != '\0' ? pi.bios_version : "unknown",
+                pi.bios_date[0u] != '\0' ? pi.bios_date : "unknown");
+        } else {
+            snprintf(text, sizeof(text), "%s",
+                "Motherboard/BIOS: no SMBIOS table reported");
+        }
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        if (have_si) {
+            snprintf(text, sizeof(text), "Physical RAM: %llu MiB",
+                (unsigned long long)(si.memory_total_kb / 1024u));
+            add_wrapped_line(lines, count, false, text, wrap_cols);
+        }
+        if (have_pi && (pi.flags & BOOK8_PLATFORM_DIMMS_VALID) != 0u) {
+            snprintf(text, sizeof(text),
+                "DIMMs: %u of %u slots populated, %u MiB; %s",
+                (unsigned)pi.dimm_count, (unsigned)pi.dimm_slots,
+                (unsigned)pi.dimm_installed_mb, pi.memory_layout);
+        } else {
+            snprintf(text, sizeof(text), "%s",
+                "DIMM layout: not reported by SMBIOS");
+        }
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        if (have_si && si.disk_count != 0u) {
+            snprintf(text, sizeof(text),
+                "Storage: %.40s; %u device(s), %llu MiB",
+                si.disk_label[0u] != '\0' ? si.disk_label : "unknown model",
+                si.disk_count,
+                (unsigned long long)(si.disk_total_kb / 1024u));
+        } else {
+            snprintf(text, sizeof(text), "%s",
+                "Storage: no disk detected");
+        }
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        add_wrapped_line(lines, count, false,
+            "Serial console: COM1 at 0x3f8, 115200 8N1 (kernel setting)",
+            wrap_cols);
+        if (have_pi) {
+            snprintf(text, sizeof(text), "Firmware interface: %s",
+                pi.boot_mode);
+            add_wrapped_line(lines, count, false, text, wrap_cols);
+        }
+        break;
+    }
+
+    case NVDIAG_FIRMWARE_PLATFORM: {
+        struct book8_platform_info pi = {0};
+        bool have_pi = platform->platform_info != NULL
+            && platform->platform_info(&pi);
+        const char *boot_mode = have_pi && pi.boot_mode[0u] != '\0'
+            ? pi.boot_mode : "not detected";
+
+        add_wrapped_line(lines, count, true,
+            "FIRMWARE AND PLATFORM STATE (live)", wrap_cols);
+        snprintf(text, sizeof(text), "FW-1 Boot mode: %s", boot_mode);
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+
+        snprintf(text, sizeof(text), "FW-2 Above 4G decoding: %s%s",
+            platform_state_text(pi.above_4g),
+            pi.above_4g == BOOK8_PLATFORM_ON
+                ? " (GPU BAR placed above 4 GiB)"
+                : pi.above_4g == BOOK8_PLATFORM_OFF
+                    ? " (GPU BARs below 4 GiB)" : "");
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+
+        snprintf(text, sizeof(text),
+            "FW-3 Resizable BAR / SAM: %s (BAR1 %llu MiB)",
+            platform_state_text(pi.resizable_bar),
+            (unsigned long long)(s->bar1_size / (1024u * 1024u)));
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+
+        if ((pi.flags & BOOK8_PLATFORM_ACPI_VALID) != 0u) {
+            snprintf(text, sizeof(text),
+                "FW-4 IOMMU: %s (ACPI %s)",
+                platform_state_text(pi.iommu),
+                pi.iommu == BOOK8_PLATFORM_ON
+                    ? "DMAR/IVRS present" : "no DMAR/IVRS table");
+        } else {
+            snprintf(text, sizeof(text), "%s",
+                "FW-4 IOMMU: not reported (ACPI tables unavailable)");
+        }
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+
+        snprintf(text, sizeof(text),
+            "FW-5 Fast Boot: %s (firmware setting not exposed to OS)",
+            platform_state_text(pi.fast_boot));
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+
+        snprintf(text, sizeof(text),
+            "FW-6 Video handoff: CSM %s, GOP %s",
+            platform_bool_text(pi.csm_video),
+            platform_bool_text(pi.gop_video));
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+
+        if (pi.secure_boot == BOOK8_PLATFORM_OFF) {
+            snprintf(text, sizeof(text), "%s",
+                "FW-7 Secure Boot: not available (Legacy/CSM boot)");
+        } else if (pi.secure_boot == BOOK8_PLATFORM_ON) {
+            snprintf(text, sizeof(text), "%s",
+                "FW-7 Secure Boot: enabled (UEFI variable)");
+        } else {
+            snprintf(text, sizeof(text), "%s",
+                "FW-7 Secure Boot: not reported (UEFI variables not read)");
+        }
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+
+        if ((s->flags & BOOK8_NVDIAG_PCI_EXPRESS) != 0u) {
+            snprintf(text, sizeof(text),
+                "FW-8 PCIe link: Gen%u x%u (max Gen%u x%u), %u GT/s cap",
+                (unsigned)pcie_generation(s->pcie_link_status),
+                (unsigned)pcie_lanes(s->pcie_link_status),
+                (unsigned)pcie_generation(s->pcie_link_cap),
+                (unsigned)pcie_lanes(s->pcie_link_cap),
+                (unsigned)(pcie_generation(s->pcie_link_cap) == 1u ? 2u
+                    : pcie_generation(s->pcie_link_cap) == 2u ? 5u
+                    : pcie_generation(s->pcie_link_cap) == 3u ? 8u : 16u));
+        } else {
+            snprintf(text, sizeof(text), "%s",
+                "FW-8 PCIe link: not sampled (no PCIe capability)");
+        }
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+
+        snprintf(text, sizeof(text),
+            "VBIOS ROM BAR: %08x (%s); image not parsed",
+            s->rom_bar,
+            (s->rom_bar & 1u) != 0u ? "enabled" : "disabled");
+        add_wrapped_line(lines, count, false, text, wrap_cols);
+        break;
+    }
+
+    case NVDIAG_FIRMWARE: {
+        struct book8_platform_info pi = {0};
+        bool have_pi = platform->platform_info != NULL
+            && platform->platform_info(&pi);
         add_line(lines, count, true, "FIRMWARE AND ARCHITECTURE");
         snprintf(text, sizeof(text), "Architecture: Maxwell GM204, ID 0x%03x",
             s->chipset);
         add_line(lines, count, false, text);
-        add_line(lines, count, false,
-            "VBIOS image: not parsed by BOOK8.");
+        snprintf(text, sizeof(text),
+            "VBIOS ROM BAR: %08x (%s); image not parsed by BOOK8",
+            s->rom_bar, (s->rom_bar & 1u) != 0u ? "enabled" : "disabled");
+        add_line(lines, count, false, text);
         add_line(lines, count, false,
             "ACR firmware: no loader active; firmware not loaded by BOOK8.");
         add_line(lines, count, false,
             (s->flags & BOOK8_NVDIAG_SCANOUT_VALID) != 0u
                 ? "Display scanout was inherited from the boot firmware."
                 : "Firmware display scanout was not adopted.");
+        if (have_pi && pi.boot_mode[0u] != '\0') {
+            snprintf(text, sizeof(text), "Firmware interface: %s",
+                pi.boot_mode);
+            add_line(lines, count, false, text);
+        }
+        if (have_pi && (pi.flags & BOOK8_PLATFORM_SMBIOS_VALID) != 0u
+            && pi.bios_version[0u] != '\0') {
+            snprintf(text, sizeof(text), "System BIOS: %.40s",
+                pi.bios_version);
+            add_line(lines, count, false, text);
+        }
         add_line(lines, count, false,
             "No firmware/register writes are performed by this utility.");
         break;
+    }
 
     case NVDIAG_ACCEL:
         add_line(lines, count, true, "COPY ENGINE ACCELERATION");
@@ -348,8 +648,18 @@ static void build_lines(enum nvdiag_tab tab,
         } else if ((s->flags & BOOK8_NVDIAG_ACCEL_FAILED) != 0u) {
             add_line(lines, count, false,
                 "State: disabled after fence timeout");
+        } else if ((s->flags & BOOK8_NVDIAG_MAPPED) == 0u) {
+            add_line(lines, count, false,
+                "State: not probed (GPU registers not mapped)");
+        } else if ((s->flags & BOOK8_NVDIAG_CE_FOUND) != 0u) {
+            add_line(lines, count, false,
+                "State: copy engine found but not active (software rendering)");
+        } else if ((s->flags & BOOK8_NVDIAG_CHANNEL_BOUND) == 0u) {
+            add_line(lines, count, false,
+                "State: channel not bound (software rendering)");
         } else {
-            add_line(lines, count, false, "State: inactive (software rendering)");
+            add_line(lines, count, false,
+                "State: not active (software rendering)");
         }
         if ((s->flags & BOOK8_NVDIAG_CE_FOUND) != 0u) {
             snprintf(text, sizeof(text),
@@ -414,6 +724,67 @@ static void draw_tab(const struct book8gui_platform *platform,
     platform->draw_text(rect->x + 8u, rect->y + 3u, text, foreground, face);
 }
 
+/* Writes one complete tab (without viewport wrapping) through the GUI hook. */
+static bool write_tab_to_file(const struct book8gui_platform *platform,
+    enum nvdiag_tab tab, const char *path, uint32_t wrap_cols)
+{
+    if (platform->write_file == NULL) {
+        return false;
+    }
+    struct book8_nvdiag_snapshot snapshot = {0};
+    bool snapshot_ok = platform->nvdiag_snapshot != NULL
+        && platform->nvdiag_snapshot(&snapshot);
+    struct nvdiag_line lines[NVDIAG_MAX_LINES];
+    uint32_t count = 0u;
+    build_lines(platform, tab, &snapshot, snapshot_ok, lines, &count,
+        wrap_cols);
+
+    char content[NVDIAG_MAX_LINES * (NVDIAG_LINE_LEN + 2u) + 128u];
+    uint32_t used = 0u;
+    int written = snprintf(content, sizeof(content),
+        "NV Diagnostic - %s\r\n", tab_names[tab]);
+    if (written < 0 || (uint32_t)written >= sizeof(content)) {
+        return false;
+    }
+    used = (uint32_t)written;
+    for (uint32_t i = 0u; i < count; ++i) {
+        written = snprintf(content + used, sizeof(content) - used,
+            "%s\r\n", lines[i].text);
+        if (written < 0 || (uint32_t)written >= sizeof(content) - used) {
+            return false;
+        }
+        used += (uint32_t)written;
+    }
+    return platform->write_file(path, content, used);
+}
+
+static void save_current_tab(const struct book8gui_platform *platform,
+    struct nvdiag_state *state)
+{
+    bool ok = write_tab_to_file(platform, state->tab,
+        "A:\\NVDIAG_SAVE.TXT", NVDIAG_LINE_LEN - 1u);
+    snprintf(state->status, sizeof(state->status),
+        ok ? "Saved A:\\NVDIAG_SAVE.TXT" : "USB save failed");
+}
+
+/* Shift+F6 never reuses the F6 filename, so earlier saves are not overwritten. */
+static void save_all_tabs(const struct book8gui_platform *platform,
+    struct nvdiag_state *state)
+{
+    for (uint32_t i = 0u; i < NVDIAG_TAB_COUNT; ++i) {
+        char path[32];
+        snprintf(path, sizeof(path), "A:\\NVDIAG_TAB%u.TXT", (unsigned)i);
+        if (!write_tab_to_file(platform, (enum nvdiag_tab)i, path,
+                NVDIAG_LINE_LEN - 1u)) {
+            snprintf(state->status, sizeof(state->status),
+                "USB export failed at tab %u", (unsigned)i);
+            return;
+        }
+    }
+    snprintf(state->status, sizeof(state->status),
+        "Exported 8 tabs to A:\\NVDIAG_TAB*.TXT");
+}
+
 static void render(const struct book8gui_platform *platform,
     struct WindowApp *app)
 {
@@ -424,9 +795,11 @@ static void render(const struct book8gui_platform *platform,
     bool snapshot_ok = platform->nvdiag_snapshot != NULL
         && platform->nvdiag_snapshot(&snapshot);
     compute_layout(app, &layout);
-    build_lines(((struct nvdiag_state *)app->state)->tab, &snapshot,
-        snapshot_ok, lines, &count);
     struct nvdiag_state *state = app->state;
+    uint32_t wrap_cols = layout.limit_x > layout.text_x
+        ? (layout.limit_x - layout.text_x) / 8u : 1u;
+    build_lines(platform, state->tab, &snapshot, snapshot_ok, lines, &count,
+        wrap_cols);
     uint32_t max_first = count > layout.rows ? count - layout.rows : 0u;
     if (state->first > max_first) {
         state->first = max_first;
@@ -467,7 +840,10 @@ static bool handle_event(const struct book8gui_platform *platform,
     bool snapshot_ok = platform->nvdiag_snapshot != NULL
         && platform->nvdiag_snapshot(&snapshot);
     compute_layout(app, &layout);
-    build_lines(state->tab, &snapshot, snapshot_ok, lines, &count);
+    uint32_t wrap_cols = layout.limit_x > layout.text_x
+        ? (layout.limit_x - layout.text_x) / 8u : 1u;
+    build_lines(platform, state->tab, &snapshot, snapshot_ok, lines, &count,
+        wrap_cols);
     uint32_t max_first = count > layout.rows ? count - layout.rows : 0u;
 
     if (event->type == BOOK8GUI_EVENT_MOUSE) {
@@ -526,22 +902,28 @@ static bool handle_event(const struct book8gui_platform *platform,
         }
         return app->visible;
     }
-    switch (event->key & BOOK8GUI_KEY_MASK) {
+    uint32_t key = event->key & BOOK8GUI_KEY_MASK;
+    bool shift_pressed = (event->key & BOOK8GUI_KEY_SHIFT) != 0u;
+    switch (key) {
     case BOOK8GUI_KEY_F5:
         snprintf(state->status, sizeof(state->status),
             "Live snapshot refreshed.");
+        break;
+    case BOOK8GUI_KEY_F6:
+        if (shift_pressed) {
+            save_all_tabs(platform, state);
+        } else {
+            save_current_tab(platform, state);
+        }
         break;
     case BOOK8GUI_KEY_UP:
     case BOOK8GUI_KEY_DOWN:
     case BOOK8GUI_KEY_PAGE_UP:
     case BOOK8GUI_KEY_PAGE_DOWN: {
-        int32_t direction = (event->key & BOOK8GUI_KEY_MASK)
-            == BOOK8GUI_KEY_UP
-            || (event->key & BOOK8GUI_KEY_MASK) == BOOK8GUI_KEY_PAGE_UP
-            ? -1 : 1;
-        uint32_t amount = (event->key & BOOK8GUI_KEY_MASK)
-            == BOOK8GUI_KEY_PAGE_UP
-            || (event->key & BOOK8GUI_KEY_MASK) == BOOK8GUI_KEY_PAGE_DOWN
+        int32_t direction = key == BOOK8GUI_KEY_UP
+            || key == BOOK8GUI_KEY_PAGE_UP ? -1 : 1;
+        uint32_t amount = key == BOOK8GUI_KEY_PAGE_UP
+            || key == BOOK8GUI_KEY_PAGE_DOWN
             ? (layout.rows != 0u ? layout.rows : 1u) : 1u;
         int64_t next = (int64_t)state->first + direction * (int64_t)amount;
         state->first = next < 0 ? 0u
@@ -551,7 +933,7 @@ static bool handle_event(const struct book8gui_platform *platform,
     case BOOK8GUI_KEY_LEFT:
     case BOOK8GUI_KEY_RIGHT:
         state->tab = (enum nvdiag_tab)((state->tab
-            + (event->key == BOOK8GUI_KEY_RIGHT ? 1u : NVDIAG_TAB_COUNT - 1u))
+            + (key == BOOK8GUI_KEY_RIGHT ? 1u : NVDIAG_TAB_COUNT - 1u))
             % NVDIAG_TAB_COUNT);
         state->first = 0u;
         break;

@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include "../../include/stdio.h"
 #include "../../include/string.h"
+#include "../../include/syscall.h"
 #include "../../net/network_settings.h"
 #include "../registry.h"
 #include "../session.h"
@@ -16,7 +17,30 @@
 #define NETWORK_RETRY_MAX 16000u
 #define NETWORK_RETRY_STEP 1000u
 #define SETTINGS_CATEGORY_COUNT 8u
+/* Frozen at 8: category indices are persisted in the registry and exposed to
+ * tests. Adding a category requires an explicit migration, not a silent bump. */
+_Static_assert(SETTINGS_CATEGORY_COUNT == 8u,
+    "SETTINGS_CATEGORY_COUNT is frozen at 8");
 #define SETTINGS_NAV_ROW_H 54u
+#define ABOUT_OPEN_WIDTH 64u
+#define ABOUT_DOC_COUNT 6u
+#define ABOUT_DOC_ROW_H 24u
+
+struct about_doc {
+    const char *label;
+    const char *path;
+};
+
+/* Packaged by build.sh into A:\DOC and by the installer into the installed
+ * root. These are real Code Editor links, not just labels in the about box. */
+static const struct about_doc about_docs[ABOUT_DOC_COUNT] = {
+    {"README", "A:\\DOC\\README.MD"},
+    {"DEVREADME", "A:\\DOC\\DEVREAD.MD"},
+    {"KERNEL_NOTES", "A:\\DOC\\KERNELNO.MD"},
+    {"CHECKPOINT", "A:\\DOC\\CHECKPT.MD"},
+    {"OPENCODE_MAP", "A:\\DOC\\OPENCODE.MAP"},
+    {"INSTALLER", "A:\\DOC\\INSTALL.TXT"}
+};
 
 struct settings_state {
     enum book8_control_page page;
@@ -42,14 +66,21 @@ struct settings_state {
     char profile_new_password[BOOK8_SESSION_PASSWORD_MAX + 1u];
     char profile_confirm_password[BOOK8_SESSION_PASSWORD_MAX + 1u];
     uint8_t profile_focus;
+    uint32_t about_focus;
+    bool about_open;
     char message[96], network_state[48];
 };
 
 static struct settings_state settings;
 
 struct settings_layout {
-    struct book8gui_rect header, sidebar, content, track, status, apply, reset, renew;
+    struct book8gui_rect header, sidebar, content, track, status, apply, reset, renew, about;
     uint32_t rows, total, fields, nav_rows;
+};
+
+struct about_layout {
+    struct book8gui_rect panel, open, close;
+    uint32_t rows;
 };
 
 static const char *const pages[SETTINGS_CATEGORY_COUNT] = {
@@ -392,16 +423,25 @@ static void layout_for(const struct book8gui_platform *p,
         c.y + header_height + body + 8u,
         c.width > side + 8u ? c.width - side - 8u : 0u, 20u};
     uint32_t reset_width = 56u;
+    l->about = (struct book8gui_rect){0u, 0u, 0u, 0u};
     uint32_t apply_width = l->header.width > reset_width + 20u
         ? l->header.width - reset_width - 20u : 90u;
-    l->apply = (struct book8gui_rect){l->header.x + l->header.width
-        - apply_width - reset_width - 8u, l->header.y + 8u,
-        apply_width, 26u};
-    l->reset = (struct book8gui_rect){l->apply.x + apply_width + 4u,
-        l->apply.y, reset_width, 26u};
+    if (l->header.width >= 232u) {
+        apply_width = l->header.width - reset_width - ABOUT_OPEN_WIDTH - 28u;
+        l->about = (struct book8gui_rect){l->header.x + l->header.width
+            - ABOUT_OPEN_WIDTH - 4u, l->header.y + 8u, ABOUT_OPEN_WIDTH, 26u};
+        l->reset = (struct book8gui_rect){l->about.x - reset_width - 4u,
+            l->header.y + 8u, reset_width, 26u};
+    } else {
+        l->reset = (struct book8gui_rect){l->header.x + l->header.width
+            - reset_width - 4u, l->header.y + 8u, reset_width, 26u};
+    }
+    l->apply = (struct book8gui_rect){l->reset.x - apply_width - 4u,
+        l->header.y + 8u, apply_width, 26u};
     uint32_t button_width = l->content.width > 212u ? 64u
         : (l->content.width > 8u ? (l->content.width - 8u) / 3u : 0u);
     if (settings.page == BOOK8_PANEL_NETWORK) {
+        l->about = (struct book8gui_rect){0u, 0u, 0u, 0u};
         l->apply.x = l->header.x + l->header.width
             - button_width * 3u - 12u;
         l->apply.width = button_width;
@@ -1014,6 +1054,166 @@ static bool profile_event(const struct book8gui_event *event,
     return true;
 }
 
+static void about_layout(const struct settings_layout *l, struct about_layout *out)
+{
+    uint32_t width = l->content.width < 520u ? l->content.width : 520u;
+    uint32_t height = l->content.height < 380u ? l->content.height : 380u;
+    *out = (struct about_layout){0};
+    if (width == 0u || height == 0u) { return; }
+    out->panel = (struct book8gui_rect){
+        l->content.x + (l->content.width - width) / 2u,
+        l->content.y + (l->content.height - height) / 2u, width, height};
+    out->rows = height > 190u ? (height - 190u) / ABOUT_DOC_ROW_H : 0u;
+    if (width >= 148u && height >= 60u) {
+        out->close = (struct book8gui_rect){out->panel.x + width - 72u,
+            out->panel.y + height - 34u, 64u, 24u};
+        out->open = (struct book8gui_rect){out->close.x - 76u,
+            out->close.y, 68u, 24u};
+    }
+}
+
+static void about_show(const struct book8gui_platform *p)
+{
+    settings.about_open = true;
+    settings.about_focus = 0u;
+    message("Documentation links open in Code Editor; Esc closes About.");
+    if (p->diagnostic != NULL) { p->diagnostic("BOOK8-ABOUT: opened"); }
+}
+
+static void about_close(const struct book8gui_platform *p)
+{
+    settings.about_open = false;
+    message("About BOOK8 closed.");
+    if (p->diagnostic != NULL) { p->diagnostic("BOOK8-ABOUT: closed"); }
+}
+
+static bool about_open_doc(const struct book8gui_platform *p)
+{
+    if (settings.about_focus >= ABOUT_DOC_COUNT) { return false; }
+    const struct about_doc *doc = &about_docs[settings.about_focus];
+    char line[160];
+    if (p->diagnostic != NULL) {
+        snprintf(line, sizeof(line), "BOOK8-ABOUT: open %s", doc->path);
+        p->diagnostic(line);
+    }
+    if (book8gui_open_utility(BOOK8_GUI_CODEEDIT, doc->path)) {
+        snprintf(settings.message, sizeof(settings.message),
+            "Opened %s in Code Editor.", doc->label);
+        return true;
+    }
+    message("Could not open documentation in Code Editor.");
+    if (p->diagnostic != NULL) {
+        snprintf(line, sizeof(line), "BOOK8-ABOUT: open-failed %s", doc->path);
+        p->diagnostic(line);
+    }
+    return false;
+}
+
+static void about_render(const struct book8gui_platform *p,
+    const struct settings_layout *l)
+{
+    struct about_layout a;
+    about_layout(l, &a);
+    if (a.panel.width == 0u || a.panel.height == 0u) { return; }
+    p->fill_rect(a.panel.x, a.panel.y, a.panel.width, a.panel.height, UI_FACE);
+    ui_sunken(p, &a.panel, UI_FACE);
+    if (p->draw_text_scaled != NULL) {
+        p->draw_text_scaled(a.panel.x + 12u, a.panel.y + 10u, "About BOOK8",
+            UI_TEXT, UI_FACE, 2u, true);
+    } else {
+        text_clipped(p, a.panel.x + 12u, a.panel.y + 10u,
+            a.panel.width > 24u ? a.panel.width - 24u : 0u,
+            "About BOOK8", UI_TEXT, UI_FACE);
+    }
+    text_clipped(p, a.panel.x + 12u, a.panel.y + 42u,
+        a.panel.width > 24u ? a.panel.width - 24u : 0u,
+        BOOK8_GUI_VERSION, UI_SELECTED, UI_FACE);
+    text_clipped(p, a.panel.x + 12u, a.panel.y + 62u,
+        a.panel.width > 24u ? a.panel.width - 24u : 0u,
+        "BOOK8 OS documentation (opens in Code Editor):", UI_TEXT, UI_FACE);
+    for (uint32_t i = 0u; i < ABOUT_DOC_COUNT && i < a.rows; ++i) {
+        char line[120];
+        uint32_t y = a.panel.y + 86u + i * ABOUT_DOC_ROW_H;
+        bool active = i == settings.about_focus;
+        if (active) {
+            p->fill_rect(a.panel.x + 10u, y - 2u, a.panel.width - 20u,
+                ABOUT_DOC_ROW_H - 2u, UI_SELECTED);
+        }
+        snprintf(line, sizeof(line), "%s - %s", about_docs[i].label,
+            about_docs[i].path);
+        text_clipped(p, a.panel.x + 16u, y,
+            a.panel.width > 32u ? a.panel.width - 32u : 0u, line,
+            active ? UI_SELECTED_TEXT : UI_TEXT,
+            active ? UI_SELECTED : UI_FACE);
+    }
+    button(p, &a.open, "Open");
+    button(p, &a.close, "Close");
+    text_clipped(p, a.panel.x + 12u, a.panel.y + a.panel.height - 24u,
+        a.open.x > a.panel.x + 16u ? a.open.x - a.panel.x - 28u : 0u,
+        "Up/Down select; Enter opens; Esc closes", UI_MUTED, UI_FACE);
+}
+
+static bool about_event(const struct book8gui_platform *p, struct WindowApp *app,
+    const struct book8gui_event *event)
+{
+    struct settings_layout l;
+    layout_for(p, app, &l);
+    struct about_layout a;
+    about_layout(&l, &a);
+    if (event->type == BOOK8GUI_EVENT_MOUSE) {
+        bool pressed = (event->mouse_buttons & 1u) != 0u
+            && (settings.previous_buttons & 1u) == 0u;
+        settings.previous_buttons = event->mouse_buttons;
+        if (pressed) {
+            if (a.close.width != 0u
+                && ui_contains(&a.close, event->mouse_x, event->mouse_y)) {
+                about_close(p);
+            } else if (a.open.width != 0u
+                && ui_contains(&a.open, event->mouse_x, event->mouse_y)) {
+                if (about_open_doc(p)) { settings.about_open = false; }
+            } else if (event->mouse_y >= (int32_t)(a.panel.y + 84u)
+                && event->mouse_y < (int32_t)(a.panel.y + 84u
+                    + a.rows * ABOUT_DOC_ROW_H)
+                && ui_contains(&a.panel, event->mouse_x, event->mouse_y)) {
+                uint32_t row = (uint32_t)(event->mouse_y - (int32_t)a.panel.y - 84u)
+                    / ABOUT_DOC_ROW_H;
+                if (row < ABOUT_DOC_COUNT && row < a.rows) {
+                    settings.about_focus = row;
+                }
+            } else if (!ui_contains(&a.panel, event->mouse_x, event->mouse_y)) {
+                about_close(p);
+            }
+        }
+        book8gui_invalidate();
+        return true;
+    }
+    uint32_t key = event->key & BOOK8GUI_KEY_MASK;
+    switch (key) {
+    case BOOK8GUI_KEY_ESCAPE:
+        about_close(p);
+        break;
+    case BOOK8GUI_KEY_UP:
+        if (settings.about_focus != 0u) { --settings.about_focus; }
+        break;
+    case BOOK8GUI_KEY_DOWN:
+        if (settings.about_focus + 1u < ABOUT_DOC_COUNT) { ++settings.about_focus; }
+        break;
+    case BOOK8GUI_KEY_HOME:
+        settings.about_focus = 0u;
+        break;
+    case BOOK8GUI_KEY_END:
+        settings.about_focus = ABOUT_DOC_COUNT - 1u;
+        break;
+    case BOOK8GUI_KEY_ENTER:
+        if (about_open_doc(p)) { settings.about_open = false; }
+        break;
+    default:
+        return false;
+    }
+    book8gui_invalidate();
+    return true;
+}
+
 static void render(const struct book8gui_platform *p, struct WindowApp *app)
 {
     if (settings.page == BOOK8_PANEL_NETWORK) {
@@ -1084,8 +1284,10 @@ static void render(const struct book8gui_platform *p, struct WindowApp *app)
             ? "Save Profile" : "Apply & Save", dirty);
     button(p, &l.reset, settings.page == BOOK8_PANEL_PROGRAMS
         ? "Refresh" : "Reset");
+    if (l.about.width != 0u) { button(p, &l.about, "About"); }
     if (settings.page == BOOK8_PANEL_PROGRAMS) {
         programs_render(p, &l);
+        if (settings.about_open) { about_render(p, &l); }
         return;
     }
     if (settings.page == BOOK8_PANEL_ADMIN) {
@@ -1094,6 +1296,7 @@ static void render(const struct book8gui_platform *p, struct WindowApp *app)
         text_clipped(p, l.status.x + 4u, l.status.y + 2u,
             l.status.width > 8u ? l.status.width - 8u : 0u,
             settings.message, UI_TEXT, UI_FACE);
+        if (settings.about_open) { about_render(p, &l); }
         return;
     }
     ui_sunken(p, &l.content, UI_FIELD);
@@ -1197,7 +1400,7 @@ static void render(const struct book8gui_platform *p, struct WindowApp *app)
     }
     ui_sunken(p, &l.status, UI_FACE);
     const char *hint = settings.message[0] != '\0' ? settings.message
-        : "PgUp/PgDn category; Tab field; Left/Right edit; Enter save.";
+        : "PgUp/PgDn category; Tab field; Left/Right edit; F1 About; Enter save.";
     if (settings.page == BOOK8_PANEL_NETWORK && settings.message[0] == '\0') {
         hint = "Select an octet; Left/Right edits. Apply, Save, or Renew.";
     }
@@ -1206,6 +1409,7 @@ static void render(const struct book8gui_platform *p, struct WindowApp *app)
     }
     text_clipped(p, l.status.x + 4u, l.status.y + 2u,
         l.status.width > 8u ? l.status.width - 8u : 0u, hint, UI_TEXT, UI_FACE);
+    if (settings.about_open) { about_render(p, &l); }
 }
 
 static void select_page(uint32_t page)
@@ -1245,6 +1449,15 @@ static bool handle_event(const struct book8gui_platform *p, struct WindowApp *ap
 {
     struct settings_layout l;
     layout_for(p, app, &l);
+    if (settings.about_open) {
+        return about_event(p, app, event);
+    }
+    if (event->type == BOOK8GUI_EVENT_KEY
+        && (event->key & BOOK8GUI_KEY_MASK) == BOOK8GUI_KEY_F1) {
+        about_show(p);
+        book8gui_invalidate();
+        return true;
+    }
     if (settings.page == BOOK8_PANEL_PROGRAMS) {
         return programs_event(p, app, event, &l);
     }
@@ -1272,6 +1485,9 @@ static bool handle_event(const struct book8gui_platform *p, struct WindowApp *ap
                         / SETTINGS_NAV_ROW_H;
                 if (page < SETTINGS_CATEGORY_COUNT) { select_page(page); }
             }
+        } else if (pressed && l.about.width != 0u
+            && ui_contains(&l.about, event->mouse_x, event->mouse_y)) {
+            about_show(p);
         } else if (pressed && ui_contains(&l.apply, event->mouse_x, event->mouse_y)) {
             if (settings.page == BOOK8_PANEL_NETWORK) {
                 network_apply(p, true);

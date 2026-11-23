@@ -4,7 +4,7 @@
 #include "hda.h"
 
 #define HDA_STREAM_MAX_PCM_BYTES (2u * 1024u * 1024u)
-#define HDA_STREAM_MAX_WAV_BYTES (2u * 1024u * 1024u)
+#define HDA_STREAM_MAX_WAV_BYTES (16u * 1024u * 1024u)
 
 enum hda_stream_result {
     HDA_STREAM_OK = 0,

@@ -153,7 +153,8 @@ static bool has_multiboot2(const uint8_t *elf, size_t bytes)
     return false;
 }
 
-/* Copies MBI tags except cmdline/modules into out, cmdline first. */
+/* Copies MBI tags except cmdline into out, cmdline first. Module tags are
+ * retained so GRUB-provided payloads such as book8-hashes survive relaunch. */
 static enum book8_relaunch_result rewrite_mbi(const uint8_t *mbi, uint8_t *out,
     uint32_t *out_bytes, uint32_t *new_count)
 {
@@ -205,7 +206,7 @@ static enum book8_relaunch_result rewrite_mbi(const uint8_t *mbi, uint8_t *out,
             break;
         }
         uint32_t padded = (size + 7u) & ~7u;
-        if (type != MB2_TAG_CMDLINE && type != MB2_TAG_MODULE) {
+        if (type != MB2_TAG_CMDLINE) {
             if (used + padded + 8u > BOOK8_RELAUNCH_MBI_MAX) {
                 return BOOK8_RELAUNCH_MBI_TOO_LARGE;
             }

@@ -86,6 +86,12 @@ struct timer_frame {
 };
 
 struct timer_frame *exec_timer_tick(struct timer_frame *frame);
+/* True when the BSP timer must route through the user-task scheduler. */
+bool exec_user_scheduler_active(void);
+/* Start a background user task under the unified task/privilege model. */
+long exec_spawn_user(const char *path, uint64_t argv);
+/* Mark a user task terminated from its exit trampoline. */
+void exec_task_finish(struct exec_task *task, long status);
 /* Start and finish require local interrupts disabled. Test threads use no FPU. */
 bool exec_scheduler_test_start(void);
 bool exec_scheduler_test_finish(void);

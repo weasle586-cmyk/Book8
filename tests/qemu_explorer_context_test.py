@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import qemu_amd_sb710_profile as amd
+import qemu_ui_lookup as ui
 from qemu_desktop_test import QemuMonitor, available_port, wait_for_text
 
 
@@ -33,16 +34,22 @@ def main():
             monitor = QemuMonitor(port, process)
             monitor.type_text("book8gui")
             wait_for_text(serial, "BOOK8-DESKTOP: TASKBAR", 20)
+            wait_for_text(serial,
+                'WINDOW id=1 title="BOOK8 Sign In" registered', 20)
+            monitor.type_text("default")
+            wait_for_text(serial, "BOOK8-SESSION: login accepted uid=0", 20)
             monitor.set_screen_size(width, height)
             monitor.reset_pointer()
-            monitor.click(20, height - 18)
-            monitor.click(40, height - 90)
-            monitor.click(200, height - 110)
+            ui.click_program(monitor, serial, height,
+                             label="File Explorer", process=process)
             wait_for_text(serial, 'title="File Explorer" registered', 10)
-            monitor.move_to(60, 203)
+            # The sign-in modal consumes cascade slot 0, so Explorer is at
+            # (64,64) rather than its nominal (40,40). Row 8 is NVMAP.CFG
+            # at list_y 147 + 8 * 18 px.
+            monitor.move_to(89, 299)
             monitor.command("mouse_button 2", 0.1)
             monitor.command("mouse_button 0", 0.1)
-            monitor.click(65, 190)
+            monitor.click(94, 220)
             log = wait_for_text(serial, "BOOK8-NOTEEDITOR: opened path=A:\\NVMAP.CFG", 10)
             if 'title="Command Shell" registered' in log:
                 raise AssertionError("Explorer launched the command shell")

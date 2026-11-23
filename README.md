@@ -71,6 +71,20 @@ qemu-system-x86_64 -machine pc,i8042=off -m 256 `
 The startup message should report `USB HID keyboard active.` The keyboard can
 enter shell commands and control BOOK8GUI.
 
+#### Boot integrity manifest
+
+`build.sh` generates `boot/book8-hashes.bin` after the final kernel link and GRUB
+loads it as the Multiboot2 module `book8-hashes`. The manifest is an unsigned
+build-integrity record (`B8H1` version 1: a 16-byte header followed by 64-byte
+key/SHA-256 entries), not secure boot. The current build contains 13 entries
+covering the splash asset, the final kernel, the packaged `A:\BIN` payloads and
+the root `CAT.ELF`/`HELLO.ELF`/`NVMAP.ELF` files. The kernel logs
+`BOOK8-HASH: manifest loaded 13 entries` and refuses a trusted payload whose
+bytes no longer match its manifest, printing
+`BOOK8-HASH: verification failed for <KEY>` before rejecting execution. A cold
+GRUB-loaded kernel cannot hash its own running image, so the build binds the
+manifest to the exact linked `book8.elf`; a stale manifest fails the build.
+
 To validate experimental multi-core startup and affinity scheduling, run the
 focused QEMU regression from WSL. It boots disposable ISO-only VMs at 2, 4, 6,
 and 8 vCPUs and runs the `SMPTEST` command in each:
@@ -276,6 +290,13 @@ selected disk model, capacity, and exact confirmation phrase; installation
 continues only when that phrase is entered exactly. A rejected confirmation
 does not write to the target.
 
+After disk confirmation the installer lists the packaged applications and asks
+`Install applications ([A]ll default, [N]one, [S]elect, Q to cancel)`. `A` keeps
+the default selection, `N` excludes all packaged ELFs, and `S` prompts for each
+application with `Y`/`N`/`Q`. Every application is selected by default. `Q` at
+either prompt cancels before writing. Deselected ELFs are removed from the
+installed `A:\BIN` volume and are not registered for the Start menu.
+
 The bundled image installs an active MBR EFI System Partition (type `0xEF`)
 formatted FAT32, BIOS GRUB boot code, and the UEFI fallback loader at
 `EFI/BOOT/BOOTX64.EFI`. It does not change UEFI NVRAM variables. The EFI loader
@@ -312,13 +333,12 @@ installer prompt, run:
 python3 ./tests/qemu_installer_smoke.py ./build/book8-cli.iso --installer-boot-only
 ```
 
-Omit `--install-only` to include the broader keyboard, mouse and reboot tests.
-The focused check uses a temporary QEMU target and cancels before writing.
-
-It verifies PS/2 shell input, USB-only keyboard shell and BOOK8GUI input (with
-QEMU PS/2 disabled for the USB-keyboard case), USB mouse clicks in BOOK8GUI,
-confirmation cancellation, installation to a temporary QEMU drive, and cold
-boot through both BIOS and OVMF UEFI.
+`--install-only` verifies confirmation cancellation, application deselection,
+the exact packaged file set, installation to a temporary QEMU drive, and cold
+boot through both BIOS and OVMF UEFI. `--installer-boot-only` uses that same
+temporary target but cancels before writing. Omitting the mode adds the legacy
+PS/2 and USB keyboard/mouse plus reboot checks; those standalone input checks
+require the trusted USB driver media and are not part of the build's QEMU suite.
 
 The command prompt accepts PS/2 or UHCI HID boot-keyboard input (and
 serial-console input in QEMU); mouse input is handled in BOOK8GUI, not at the
@@ -533,12 +553,15 @@ readable filesystem volume if that drive is unavailable, with a diagnostic.
 An explicit missing drive or directory still fails rather than scanning a
 different volume silently.
 
-System Settings is a categorized control panel with Date & Time, Keyboard,
-Mouse / Pointer, Display, Network, Storage, Sound, Administrative Tools and
-System / About pages. Use the sidebar (wheel-scrollable in small windows), or
-PgUp/PgDn to switch categories. Tab/Up/Down selects a field; Left/Right changes
-it. Sliders also support pointer dragging, and toggles can be clicked. Enter
-or Apply saves edits from all pages; Reset discards unsaved edits.
+System Settings is a categorized control panel with eight categories: Network &
+Internet, Input & Devices, Apps & Default Apps, Display, Sounds, Storage,
+System and User Profile. Use the sidebar (wheel-scrollable in small windows),
+or PgUp/PgDn to switch categories. Tab/Up/Down selects a field; Left/Right
+changes it. Sliders also support pointer dragging, and toggles can be clicked.
+Enter or Apply saves edits from all pages; Reset discards unsaved edits. The
+`About` button in the header, or F1 from any category, opens the About BOOK8
+dialog with the GUI version and links to the packaged documentation in
+`A:\DOC`. Enter or `Open` launches the selected document in Code Editor.
 
 Preferences live in a shared, range-checked system configuration and are saved
 to `A:\BOOK8.CFG` with a versioned little-endian header and checksum. They are
@@ -942,10 +965,10 @@ NETBOOT 192.168.7.20 kernel.warm
 ```
 
 NETBOOT is rejected from the running desktop. It verifies the complete
-68–76 MiB load window is usable RAM in the firmware memory map, outside the
+80–88 MiB load window is usable RAM in the firmware memory map, outside the
 running kernel, all Multiboot modules, the Multiboot information block and the
 framebuffer, before writing any file bytes. No fallback address is guessed.
-It fetches into physical/identity-mapped virtual `0x04400000`, validates the
+It fetches into physical/identity-mapped virtual `0x05000000`, validates the
 following **little-endian** 32-byte executable header, then zeroes the image's
 declared BSS tail. Ordinary ELF, Linux, PE and Multiboot images are rejected:
 BOOK8's current `_start` expects a 32-bit boot entry, not a long-mode jump.
@@ -960,7 +983,7 @@ BOOK8's current `_start` expects a 32-bit boot entry, not a long-mode jump.
 | 24 | uint32 | Entry offset, at least 32 and strictly inside file bytes |
 | 28 | uint32 | IEEE CRC32 of the entire file with this field zeroed |
 
-Build a freestanding flat x86-64 payload for entry at `0x04400020` (or use
+Build a freestanding flat x86-64 payload for entry at `0x05000020` (or use
 position-independent code), then wrap it on the development host, for example:
 
 ```python
@@ -999,7 +1022,7 @@ wire serialization, TID locking, lost RRQ/DATA retries, duplicates, final ACK
 replay, exact-size/empty files, bounds/errors and executable rejection/CRC32.
 The default QEMU checks also run
 `python3 tests/qemu_netboot_jump_test.py`, an isolated diskless ISO exercising
-the real warm-jump assembly at 68 MiB with register/stack/flag checks.
+the real warm-jump assembly at 80 MiB with register/stack/flag checks.
 Logs are retained under `build/rtl8168-validation/`.
 This validates the transfer engine with simulated UDP and the handoff in QEMU,
 not a real RTL8168 TFTP download: QEMU still lacks this NIC model.
@@ -1223,17 +1246,24 @@ python3 tests/qemu_desktop_test.py build/book8.iso /tmp/d.img
 ```
 
 The test attaches that regular file as a raw IDE disk with QEMU snapshot mode,
-and configures an explicit UHCI controller plus `usb-mouse`; it does not use a
-physical disk or partition. The desktop boots with no windows; the test then
-launches apps from the Start menu. Expected serial markers include:
+and configures an explicit `pci-ohci` controller plus `usb-mouse`; it does not
+use a physical disk or partition. QEMU's UHCI mouse descriptor enumeration does
+not complete reliably, so this test uses the supported OHCI boot-HID path. The
+graphical desktop autostarts with the modal `BOOK8 Sign In` window; the test
+signs in as `default` and then launches apps from the Start menu. The sign-in
+modal consumes cascade slot 0, so user windows are offset by one 24 px step and
+Settings is paged from Network to Date/Time before the hour is changed.
+Expected serial markers include:
 `BOOK8-DESKTOP: TASKBAR height=36 reserved`,
-`BOOK8-DESKTOP: WINDOW id=1 title="File Explorer" registered`,
-`BOOK8-DESKTOP: WINDOW id=2 title="NoteEditor" registered`,
-`BOOK8-DESKTOP: WINDOW id=3 title="Command Shell" registered`,
-`WINDOW minimized/maximized/restored id=1`, `BOOK8-SETTINGS: time set`,
-`BOOK8-DESKTOP: WINDOW id=5 title="Task Manager" registered`,
-`BOOK8-DESKTOP: hotkey Task Manager id=5` (QEMU `sendkey ctrl-alt-esc`),
-`WINDOW closed id=1` (Task Manager End Task), focus/input-routing messages, and
+`BOOK8-DESKTOP: WINDOW id=1 title="BOOK8 Sign In" registered`,
+`BOOK8-SESSION: login accepted uid=0`,
+`BOOK8-DESKTOP: WINDOW id=2 title="File Explorer" registered`,
+`BOOK8-DESKTOP: WINDOW id=3 title="NoteEditor" registered`,
+`BOOK8-DESKTOP: WINDOW id=4 title="Command Shell" registered`,
+`WINDOW minimized/maximized/restored id=2`, `BOOK8-SETTINGS: time set`,
+`BOOK8-DESKTOP: WINDOW id=6 title="Task Manager" registered`,
+`BOOK8-DESKTOP: hotkey Task Manager id=6` (QEMU `sendkey ctrl-alt-esc`),
+`WINDOW closed id=2` (Task Manager End Task), focus/input-routing messages, and
 `BOOK8-EXPLORER: path=A:\DATA\`. The test requires positive USB mouse reports,
 `USB_QUEUE_DROPS=0`, and prints `PASS: BOOK8 desktop test` on success. It also
 checks the maximized frame's screen edges and compares NoteEditor viewport
@@ -1242,6 +1272,18 @@ scratch text. Screenshots and serial logs from this test are temporary.
 The graphics/input smoke test additionally requires both `WHEEL_DELTA=120` and
 `WHEEL_DELTA=-120` from wheel-only reports on the PS/2 and UHCI USB paths.
 Legacy `WHEEL=1`/`WHEEL=-1` diagnostic detent counts remain for older log readers.
+
+For the Explorer context-menu path, run:
+
+```sh
+python3 tests/qemu_explorer_context_test.py build/book8-cli.iso build/book8-data16.img
+```
+
+It signs in, resolves File Explorer from the live program rows, right-clicks
+`A:\NVMAP.CFG`, chooses Open, checks that NoteEditor opens the `.CFG` fallback
+instead of the command shell, then exits the desktop. It uses a snapshot copy of
+the disposable data image and prints
+`PASS: Explorer context Open, editor fallback and explicit desktop exit`.
 
 For Add/Remove Programs persistence and menu launch coverage, run:
 

@@ -18,12 +18,12 @@ kernel_main:
     mov $3, %al
     outb %al, %dx
     lea payload(%rip), %rsi
-    mov $0x04400000, %edi
+    mov $0x05000000, %edi
     mov $(payload_end - payload), %ecx
     rep movsb
     mov %cr3, %rax
     mov %rax, warm_info + 40(%rip)
-    mov $0x04400000, %edi
+    mov $0x05000000, %edi
     lea warm_stack_end(%rip), %rsi
     lea warm_info(%rip), %rdx
     call book8_netboot_jump
@@ -36,7 +36,7 @@ payload:
     jne failure
     cmpq $1, 8(%rsi)
     jne failure
-    cmpq $0x04400000, 16(%rsi)
+    cmpq $0x05000000, 16(%rsi)
     jne failure
     mov %cr3, %rax
     cmp %rax, 40(%rsi)
@@ -82,7 +82,7 @@ payload_end:
 .section .data
 .balign 8
 warm_info:
-    .quad 0x314d524157384b42, 1, 0x04400000
+    .quad 0x314d524157384b42, 1, 0x05000000
     .quad payload_end - payload, payload_end - payload, 0
 .section .bss
 .balign 16

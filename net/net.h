@@ -14,6 +14,39 @@
     (((uint32_t)(a) << 24u) | ((uint32_t)(b) << 16u) \
         | ((uint32_t)(c) << 8u) | (uint32_t)(d))
 
+/* ------------------------------------------------------------
+ * Network & security feature flags (Phase 6).
+ * These are compile-time switches; changing them requires a full
+ * rebuild and regression test pass.
+ * ------------------------------------------------------------ */
+
+/* IPv6: 0 = disabled (no full stack, address/header stubs only).
+   1 = reserved for a future full implementation. */
+#ifndef BOOK8_NET_IPV6
+#define BOOK8_NET_IPV6 0u
+#endif
+
+/* Firewall: 0 = disabled (default, legacy behavior).
+   1 = compile in filtering; runtime toggle via book8_net_firewall_set().
+   When active, drops unsolicited incoming IPv4 and allows established peers. */
+#ifndef BOOK8_NET_FIREWALL
+#define BOOK8_NET_FIREWALL 0u
+#endif
+
+/* DNS cache: in-memory only, no persistence across reboot. */
+#ifndef BOOK8_NET_DNS_CACHE
+#define BOOK8_NET_DNS_CACHE 1u
+#endif
+#define BOOK8_NET_DNS_CACHE_ENTRIES 8u
+#define BOOK8_NET_DNS_CACHE_NAME_MAX 64u
+#define BOOK8_NET_DNS_CACHE_TTL_MS 60000u
+
+/* TLS placeholder: handshake omitted, certificate validation disabled.
+   BROOK8 spelling is intentional (legacy compat identifier). */
+#ifndef BROOK8_TLS_EMPTY
+#define BROOK8_TLS_EMPTY 1u
+#endif
+
 /* BOOK8 is little-endian x86; API IPv4 addresses/ports are host-order values. */
 static inline uint16_t book8_ntohs(uint16_t value) { return __builtin_bswap16(value); }
 static inline uint32_t book8_ntohl(uint32_t value) { return __builtin_bswap32(value); }
@@ -106,6 +139,23 @@ struct book8_ipv4_header {
     uint32_t source, destination;
 } __attribute__((packed));
 
+#if BOOK8_NET_IPV6
+/* IPv6 header stub - layout only, no stack implementation.
+   BOOK8_NET_IPV6 is 0 by default; this exists to freeze the wire ABI
+   for a future full stack port. Addresses are 16 bytes in network order. */
+struct book8_ipv6_header {
+    uint32_t version_traffic_flow;
+    uint16_t payload_length;
+    uint8_t next_header, hop_limit;
+    uint8_t source[16], destination[16];
+} __attribute__((packed));
+#define BOOK8_IPV6_HEADER_SIZE 40u
+_Static_assert(sizeof(struct book8_ipv6_header) == BOOK8_IPV6_HEADER_SIZE,
+    "IPv6 header size");
+#endif /* BOOK8_NET_IPV6 */
+/* Query is always available so callers can detect support at runtime. */
+bool book8_net_ipv6_supported(void);
+
 struct book8_icmp_header {
     uint8_t type, code;
     uint16_t checksum, identifier, sequence;
@@ -170,6 +220,13 @@ struct book8_net {
     uint8_t rx[BOOK8_NET_FRAME_MAX], tx[BOOK8_NET_FRAME_MAX];
     void *tcp_context;
     enum book8_net_result (*tcp_input)(void *, uint32_t, const uint8_t *, size_t);
+#if BOOK8_NET_FIREWALL
+    /* Established-peer table: destinations of recent outgoing IPv4. */
+    uint32_t fw_peers[8u];
+    uint8_t fw_next;
+    bool firewall_enabled;
+    uint32_t fw_dropped;
+#endif
 };
 
 enum book8_net_result book8_net_init(struct book8_net *net,
@@ -209,6 +266,38 @@ enum book8_net_result net_telemetry_send_v2(uint64_t timestamp_ms,
     const struct net_telemetry_extended *extended, const char *log);
 uint32_t book8_net_arp_entries(const struct book8_net *net);
 
+/* In-memory DNS cache (Phase 6). No persistence across reboot; entries
+   expire BOOK8_NET_DNS_CACHE_TTL_MS after insertion. Names are compared
+   case-insensitively and truncated to BOOK8_NET_DNS_CACHE_NAME_MAX. */
+struct book8_dns_cache_entry {
+    char name[BOOK8_NET_DNS_CACHE_NAME_MAX];
+    uint32_t ip;
+    uint64_t expires_ms;
+};
+#if BOOK8_NET_DNS_CACHE
+bool book8_dns_cache_lookup(const char *name, uint64_t now_ms, uint32_t *ip);
+void book8_dns_cache_insert(const char *name, uint32_t ip, uint64_t now_ms);
+void book8_dns_cache_flush(void);
+uint32_t book8_dns_cache_entries(void);
+#endif
+
+/* Stateless firewall hook (Phase 6). Tracks destinations of outgoing IPv4
+   as "established peers"; unsolicited IPv4 from unknown sources is dropped
+   while enabled. DHCP replies (UDP 67->68) are always permitted. */
+#if BOOK8_NET_FIREWALL
+void book8_net_firewall_set(struct book8_net *net, bool enabled);
+bool book8_net_firewall_enabled(const struct book8_net *net);
+uint32_t book8_net_firewall_dropped(const struct book8_net *net);
+void book8_net_firewall_peers_clear(struct book8_net *net);
+#endif
+
+/* TLS placeholder (Phase 6). The BROOK8 spelling is intentional.
+   No handshake, no certificate validation - API exists only so callers
+   can detect the stub and fail closed on HTTPS. */
+#define BROOK8_TLS_HANDSHAKE_OMITTED 1u
+#define BROOK8_TLS_CERT_VALIDATION_DISABLED 1u
+bool brook8_tls_available(void);
+
 /* Persisted network override text (A:\BOOK8NET.CFG), host-order addresses:
  *   BOOK8NET 1 / IP a.b.c.d / MASK a.b.c.d / GATEWAY a.b.c.d / TELEMETRY a.b.c.d
  * GATEWAY and TELEMETRY may be 0.0.0.0 or omitted. Unknown keys are rejected. */
@@ -225,7 +314,9 @@ size_t book8_netcfg_format(const struct book8_netcfg *config, char *text, size_t
 #define BOOK8_TFTP_CAPACITY (8u * 1024u * 1024u)
 #define BOOK8_TFTP_TIMEOUT_MS 1000u
 #define BOOK8_TFTP_RETRIES 5u
-#define BOOK8_NETBOOT_ADDRESS 0x04400000ull
+/* Must stay above __kernel_end: the 128 KiB Code Editor document buffers make
+ * the kernel image about 70.5 MiB. The 8 MiB staging window ends at 88 MiB. */
+#define BOOK8_NETBOOT_ADDRESS 0x05000000ull
 #define BOOK8_WARM_MAGIC 0x314d524157384b42ull /* "BK8WARM1", little endian */
 
 #pragma pack(push, 1)

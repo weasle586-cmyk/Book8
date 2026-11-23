@@ -872,6 +872,12 @@ static bool begin_request(const struct book8gui_platform *p,
     browser.page[0] = '\0';
     browser.page_length = 0u;
     if (ip == 0u) {
+#if BOOK8_NET_DNS_CACHE
+        uint32_t cached_ip;
+        if (book8_dns_cache_lookup(host, milliseconds(p), &cached_ip)) {
+            return connect_request(p, app, net, cached_ip);
+        }
+#endif
         return begin_dns(p, app, net, host);
     }
     return connect_request(p, app, net, ip);
@@ -2185,6 +2191,9 @@ static void tick_dns(const struct book8gui_platform *p,
         browser.dns_net = NULL;
         browser.dns_bound = false;
         browser.dns_resolved = false;
+#if BOOK8_NET_DNS_CACHE
+        book8_dns_cache_insert(browser.dns_name, ip, milliseconds(p));
+#endif
         (void)connect_request(p, app, net, ip);
         return;
     }
@@ -2331,8 +2340,10 @@ static void follow_link(uint32_t index, const struct book8gui_platform *p,
         book8gui_invalidate();
         return;
     }
+    /* JavaScript/CSS gating: stub flags present; no engine implemented yet. */
     if (browser.links[index].media_kind == BOOK8_MEDIA_WAV
         && (book8_media_prefs()->web & BOOK8_MEDIA_WEB_OPEN_IN_PLAYER) != 0u) {
+        /* TODO: add confirmation dialog before queuing to Player */
         if (book8gui_queue_utility(BOOK8_GUI_PLAYER, target) == 0) {
             set_status("Opened WAV link in BOOK8 Player.");
         } else {
@@ -2340,6 +2351,12 @@ static void follow_link(uint32_t index, const struct book8gui_platform *p,
         }
         book8gui_invalidate();
         return;
+    }
+    if ((book8_media_prefs()->web & BOOK8_MEDIA_WEB_JAVASCRIPT) == 0u) {
+        set_status("JavaScript is disabled; link navigated without script execution.");
+    }
+    if ((book8_media_prefs()->web & BOOK8_MEDIA_WEB_CSS) == 0u) {
+        set_status("CSS layout is disabled; link rendered with basic block model.");
     }
     (void)navigate(p, app, target, true);
 }

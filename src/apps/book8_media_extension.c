@@ -8,6 +8,49 @@
 #define MEDIA_PREFS_VERSION 1u
 #define MEDIA_PREFS_BYTES 28u
 
+#define MEDIA_BOOKMARK_MAGIC 0x314b3842u /* "B8K1" little-endian */
+#define MEDIA_BOOKMARK_VERSION 1u
+#define MEDIA_BOOKMARK_HEADER_BYTES 16u
+#define MEDIA_BOOKMARK_PATH_BYTES BOOK8_MEDIA_BOOKMARK_PATH_CAPACITY
+#define MEDIA_BOOKMARK_ENTRY_BYTES \
+    (4u + BOOK8_MEDIA_BOOKMARK_LABEL_CAPACITY)
+#define MEDIA_BOOKMARK_RECORD_BYTES (MEDIA_BOOKMARK_PATH_BYTES + 4u \
+    + BOOK8_MEDIA_BOOKMARK_MAX_PER_MEDIA * MEDIA_BOOKMARK_ENTRY_BYTES)
+#define MEDIA_BOOKMARK_MAX_BYTES (MEDIA_BOOKMARK_HEADER_BYTES \
+    + BOOK8_MEDIA_BOOKMARK_MAX_MEDIA * MEDIA_BOOKMARK_RECORD_BYTES)
+
+/* Frozen A:\MEDIA.CFG bit positions. These assertions make any renumbering a
+ * build failure instead of a silent corruption of saved preferences. */
+_Static_assert(BOOK8_MEDIA_IF_STATUS == 0x01u, "IF_STATUS bit frozen");
+_Static_assert(BOOK8_MEDIA_IF_PLAYLIST == 0x02u, "IF_PLAYLIST bit frozen");
+_Static_assert(BOOK8_MEDIA_IF_DARK_CANVAS == 0x04u, "IF_DARK_CANVAS bit frozen");
+_Static_assert(BOOK8_MEDIA_IF_SUBTITLES == 0x10u, "IF_SUBTITLES bit frozen");
+
+_Static_assert(BOOK8_MEDIA_PLUGIN_PCM_WAV == 0x01u, "PLUGIN_PCM_WAV bit frozen");
+_Static_assert(BOOK8_MEDIA_PLUGIN_HTTP_WAV == 0x02u, "PLUGIN_HTTP_WAV bit frozen");
+_Static_assert(BOOK8_MEDIA_PLUGIN_PLAYLIST == 0x04u, "PLUGIN_PLAYLIST bit frozen");
+_Static_assert(BOOK8_MEDIA_PLUGIN_VISUALIZATION == 0x08u,
+    "PLUGIN_VISUALIZATION bit frozen");
+_Static_assert(BOOK8_MEDIA_PLUGIN_MP3 == 0x10u, "PLUGIN_MP3 bit frozen");
+_Static_assert(BOOK8_MEDIA_PLUGIN_Video == 0x20u, "PLUGIN_Video bit frozen");
+
+_Static_assert(BOOK8_MEDIA_WEB_AUTOPLAY == 0x01u, "WEB_AUTOPLAY bit frozen");
+_Static_assert(BOOK8_MEDIA_WEB_MEDIA_PANEL == 0x02u, "WEB_MEDIA_PANEL bit frozen");
+_Static_assert(BOOK8_MEDIA_WEB_OPEN_IN_PLAYER == 0x04u,
+    "WEB_OPEN_IN_PLAYER bit frozen");
+_Static_assert(BOOK8_MEDIA_WEB_JAVASCRIPT == 0x08u, "WEB_JAVASCRIPT bit frozen");
+_Static_assert(BOOK8_MEDIA_WEB_CSS == 0x40u, "WEB_CSS bit frozen");
+
+_Static_assert(BOOK8_MEDIA_REPEAT_NONE == 0u, "REPEAT_NONE frozen");
+_Static_assert(BOOK8_MEDIA_REPEAT_ALL == 1u, "REPEAT_ALL frozen");
+_Static_assert(BOOK8_MEDIA_REPEAT_ONE == 2u, "REPEAT_ONE frozen");
+
+_Static_assert(MEDIA_PREFS_BYTES == 28u, "MEDIA.CFG size must stay frozen");
+_Static_assert(MEDIA_BOOKMARK_RECORD_BYTES == 388u,
+    "MEDIA.BMK record layout must stay fixed");
+_Static_assert(MEDIA_BOOKMARK_MAX_BYTES <= 4096u,
+    "MEDIA.BMK must stay bounded");
+
 static struct book8_media_preferences media_preferences = {
     BOOK8_MEDIA_IF_STATUS,
     BOOK8_MEDIA_PLUGIN_PCM_WAV | BOOK8_MEDIA_PLUGIN_HTTP_WAV
@@ -57,9 +100,11 @@ void book8_media_prefs_defaults(struct book8_media_preferences *prefs)
     prefs->plugins = BOOK8_MEDIA_PLUGIN_PCM_WAV
         | BOOK8_MEDIA_PLUGIN_HTTP_WAV | BOOK8_MEDIA_PLUGIN_PLAYLIST;
     prefs->web = BOOK8_MEDIA_WEB_AUTOPLAY | BOOK8_MEDIA_WEB_MEDIA_PANEL
-        | BOOK8_MEDIA_WEB_OPEN_IN_PLAYER;
+        | BOOK8_MEDIA_WEB_OPEN_IN_PLAYER
+        | BOOK8_MEDIA_WEB_JAVASCRIPT | BOOK8_MEDIA_WEB_CSS;
     prefs->max_volume = 100u;
     prefs->repeat = BOOK8_MEDIA_REPEAT_NONE;
+    /* TODO: add preferred_audio_track field when stereo/mono selection is implemented */
 }
 
 bool book8_media_prefs_equal(const struct book8_media_preferences *a,
@@ -143,6 +188,181 @@ static bool equal_ascii(const char *left, const char *right)
         }
     }
     return *left == '\0' && *right == '\0';
+}
+
+static uint32_t bookmark_text_length(const char *text, uint32_t capacity)
+{
+    uint32_t length = 0u;
+    if (text == NULL) {
+        return 0u;
+    }
+    while (length < capacity && text[length] != '\0') {
+        ++length;
+    }
+    return length;
+}
+
+static void bookmark_write_text(uint8_t *destination, const char *source,
+    uint32_t capacity)
+{
+    uint32_t length = bookmark_text_length(source, capacity);
+    if (length == capacity) {
+        --length;
+    }
+    memset(destination, 0, capacity);
+    if (length != 0u) {
+        memcpy(destination, source, length);
+    }
+}
+
+static void bookmark_read_text(char *destination, const uint8_t *source,
+    uint32_t capacity)
+{
+    uint32_t length = bookmark_text_length((const char *)source, capacity);
+    memcpy(destination, source, length);
+    destination[length] = '\0';
+}
+
+static uint8_t *bookmark_record(uint8_t *bytes, uint32_t index)
+{
+    return bytes + MEDIA_BOOKMARK_HEADER_BYTES
+        + index * MEDIA_BOOKMARK_RECORD_BYTES;
+}
+
+static bool bookmark_decode(const uint8_t *bytes, uint32_t size,
+    uint32_t *count)
+{
+    uint32_t records = 0u;
+    if (bytes == NULL || count == NULL || size < MEDIA_BOOKMARK_HEADER_BYTES
+        || media_get32(bytes) != MEDIA_BOOKMARK_MAGIC
+        || media_get32(bytes + 4u) != MEDIA_BOOKMARK_VERSION) {
+        return false;
+    }
+    records = media_get32(bytes + 8u);
+    if (records > BOOK8_MEDIA_BOOKMARK_MAX_MEDIA
+        || size != MEDIA_BOOKMARK_HEADER_BYTES
+            + records * MEDIA_BOOKMARK_RECORD_BYTES
+        || media_get32(bytes + 12u)
+            != media_checksum(bytes + MEDIA_BOOKMARK_HEADER_BYTES,
+                size - MEDIA_BOOKMARK_HEADER_BYTES)) {
+        return false;
+    }
+    for (uint32_t i = 0u; i < records; ++i) {
+        const uint8_t *record = bytes + MEDIA_BOOKMARK_HEADER_BYTES
+            + i * MEDIA_BOOKMARK_RECORD_BYTES;
+        if (bookmark_text_length((const char *)record,
+                MEDIA_BOOKMARK_PATH_BYTES) == 0u
+            || media_get32(record + MEDIA_BOOKMARK_PATH_BYTES)
+                > BOOK8_MEDIA_BOOKMARK_MAX_PER_MEDIA) {
+            return false;
+        }
+    }
+    *count = records;
+    return true;
+}
+
+static void bookmark_encode_record(uint8_t *record, const char *path,
+    const struct book8_media_bookmark_set *set)
+{
+    bookmark_write_text(record, path, MEDIA_BOOKMARK_PATH_BYTES);
+    media_put32(record + MEDIA_BOOKMARK_PATH_BYTES, set->count);
+    for (uint32_t i = 0u; i < BOOK8_MEDIA_BOOKMARK_MAX_PER_MEDIA; ++i) {
+        uint8_t *entry = record + MEDIA_BOOKMARK_PATH_BYTES + 4u
+            + i * MEDIA_BOOKMARK_ENTRY_BYTES;
+        if (i < set->count) {
+            media_put32(entry, set->bookmarks[i].position_ms);
+            bookmark_write_text(entry + 4u, set->bookmarks[i].label,
+                BOOK8_MEDIA_BOOKMARK_LABEL_CAPACITY);
+        } else {
+            memset(entry, 0, MEDIA_BOOKMARK_ENTRY_BYTES);
+        }
+    }
+}
+
+bool book8_media_bookmarks_load(const struct book8gui_platform *platform,
+    const char *path, struct book8_media_bookmark_set *set)
+{
+    uint8_t bytes[MEDIA_BOOKMARK_MAX_BYTES];
+    uint32_t size = 0u;
+    uint32_t records = 0u;
+    if (platform == NULL || platform->read_file == NULL || path == NULL
+        || set == NULL || bookmark_text_length(path,
+            BOOK8_MEDIA_BOOKMARK_PATH_CAPACITY) == 0u) {
+        return false;
+    }
+    if (!platform->read_file(BOOK8_MEDIA_BOOKMARK_PATH, bytes, sizeof(bytes),
+            &size)
+        || !bookmark_decode(bytes, size, &records)) {
+        return false;
+    }
+    for (uint32_t i = 0u; i < records; ++i) {
+        const uint8_t *record = bytes + MEDIA_BOOKMARK_HEADER_BYTES
+            + i * MEDIA_BOOKMARK_RECORD_BYTES;
+        if (!equal_ascii((const char *)record, path)) {
+            continue;
+        }
+        memset(set, 0, sizeof(*set));
+        snprintf(set->path, sizeof(set->path), "%s", path);
+        set->count = media_get32(record + MEDIA_BOOKMARK_PATH_BYTES);
+        for (uint32_t j = 0u; j < set->count; ++j) {
+            const uint8_t *entry = record + MEDIA_BOOKMARK_PATH_BYTES + 4u
+                + j * MEDIA_BOOKMARK_ENTRY_BYTES;
+            set->bookmarks[j].position_ms = media_get32(entry);
+            bookmark_read_text(set->bookmarks[j].label, entry + 4u,
+                BOOK8_MEDIA_BOOKMARK_LABEL_CAPACITY);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool book8_media_bookmarks_save(const struct book8gui_platform *platform,
+    const char *path, const struct book8_media_bookmark_set *set)
+{
+    uint8_t bytes[MEDIA_BOOKMARK_MAX_BYTES];
+    uint32_t size = 0u;
+    uint32_t records = 0u;
+    uint32_t target = 0u;
+    if (platform == NULL || platform->write_file == NULL || path == NULL
+        || set == NULL || set->count > BOOK8_MEDIA_BOOKMARK_MAX_PER_MEDIA
+        || bookmark_text_length(path, BOOK8_MEDIA_BOOKMARK_PATH_CAPACITY) == 0u) {
+        return false;
+    }
+    memset(bytes, 0, sizeof(bytes));
+    if (platform->read_file != NULL
+        && platform->read_file(BOOK8_MEDIA_BOOKMARK_PATH, bytes, sizeof(bytes),
+            &size)
+        && bookmark_decode(bytes, size, &records)) {
+        /* Keep the existing decoded records. */
+    } else {
+        records = 0u;
+        memset(bytes, 0, sizeof(bytes));
+    }
+    for (uint32_t i = 0u; i < records; ++i) {
+        const uint8_t *record = bookmark_record(bytes, i);
+        if (equal_ascii((const char *)record, path)) {
+            target = i;
+            break;
+        }
+        target = i + 1u;
+    }
+    if (target >= BOOK8_MEDIA_BOOKMARK_MAX_MEDIA) {
+        target = BOOK8_MEDIA_BOOKMARK_MAX_MEDIA - 1u;
+    }
+    if (target >= records) {
+        records = target + 1u;
+    }
+    bookmark_encode_record(bookmark_record(bytes, target), path, set);
+
+    media_put32(bytes, MEDIA_BOOKMARK_MAGIC);
+    media_put32(bytes + 4u, MEDIA_BOOKMARK_VERSION);
+    media_put32(bytes + 8u, records);
+    size = MEDIA_BOOKMARK_HEADER_BYTES
+        + records * MEDIA_BOOKMARK_RECORD_BYTES;
+    media_put32(bytes + 12u, media_checksum(
+        bytes + MEDIA_BOOKMARK_HEADER_BYTES,
+        size - MEDIA_BOOKMARK_HEADER_BYTES));
+    return platform->write_file(BOOK8_MEDIA_BOOKMARK_PATH, bytes, size);
 }
 
 static bool ends_with_ascii(const char *text, const char *suffix)

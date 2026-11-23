@@ -256,6 +256,9 @@ static struct uhci_transfer_descriptor control_transfer_descriptors[UHCI_MAX_TDS
 static uint8_t descriptor_buffer[USB_DESCRIPTOR_BUFFER]
     __attribute__((aligned(4096)));
 static uint8_t setup_buffer[8] __attribute__((aligned(16)));
+static uint8_t bulk_buffer[512] __attribute__((aligned(4096)));
+static uint8_t cbw_buffer[31] __attribute__((aligned(16)));
+static uint8_t csw_buffer[13] __attribute__((aligned(16)));
 static uint8_t interrupt_buffers[USB_MAX_HID_DEVICES][USB_MAX_PACKET]
     __attribute__((aligned(4096)));
 static struct book8_usb_diagnostics diagnostics;
@@ -294,6 +297,13 @@ static void descriptor_log_hex32(uint32_t value)
     for (uint32_t shift = 32u; shift != 0u; shift -= 4u) {
         book8_usb_debug_serial_putc(digits[(value >> (shift - 4u)) & 0x0fu]);
     }
+}
+
+static void usb_storage_log(const char *text)
+{
+    descriptor_log_text(text);
+    book8_usb_debug_serial_putc('\r');
+    book8_usb_debug_serial_putc('\n');
 }
 
 static void log_uhci_descriptor(const char *event, uint32_t controller_index,
@@ -1657,6 +1667,413 @@ void book8_usb_bind_configuration_interfaces(uint16_t vendor_id,
     }
 }
 
+static bool uhci_bulk_transfer(struct uhci_controller *controller,
+    bool low_speed, uint8_t address, uint8_t endpoint, uint8_t pid,
+    uint8_t *data, uint16_t length, uint8_t *toggle)
+{
+    if (endpoint == 0u || length == 0u || length > 512u || data == NULL) {
+        return false;
+    }
+    uint16_t io_base = controller->io_base;
+    if (!stop_uhci_controller(io_base)) {
+        return false;
+    }
+    control_transfer_descriptors[0].link = UHCI_LINK_TERMINATE;
+    control_transfer_descriptors[0].status = td_status(low_speed)
+        | (pid == USB_PID_IN ? UHCI_STATUS_SHORT_PACKET_DETECT : 0u);
+    control_transfer_descriptors[0].token =
+        td_token(pid, address, endpoint, *toggle, length);
+    control_transfer_descriptors[0].buffer =
+        usb_dma_address32(data, length);
+    control_queue.horizontal = UHCI_LINK_TERMINATE;
+    control_queue.element = uhci_link_pointer(
+        &control_transfer_descriptors[0], 0u);
+    for (uint32_t i = 0u; i < UHCI_FRAME_COUNT; ++i) {
+        frame_list[controller - controllers][i] =
+            uhci_link_pointer(&control_queue, UHCI_LINK_QH);
+    }
+    __asm__ volatile ("" : : : "memory");
+    out16(io_base + 0x06u, 0u);
+    out16(io_base + 0x00u, UHCI_COMMAND_CONFIGURED
+        | UHCI_COMMAND_MAX_PACKET | UHCI_COMMAND_RUN);
+    if (!wait_td(io_base, &control_transfer_descriptors[0])) {
+        out16(io_base + 0x00u, 0u);
+        usb_storage_log("USB-STORAGE: bulk wait timeout");
+        descriptor_log_hex32(control_transfer_descriptors[0].status);
+        book8_usb_debug_serial_putc('\r');
+        book8_usb_debug_serial_putc('\n');
+        return false;
+    }
+    uint32_t status = control_transfer_descriptors[0].status;
+    out16(io_base + 0x00u, 0u);
+    if ((status & UHCI_STATUS_ACTIVE) != 0u
+        || (status & UHCI_STATUS_ERRORS) != 0u) {
+        usb_storage_log("USB-STORAGE: bulk status error");
+        descriptor_log_hex32(status);
+        book8_usb_debug_serial_putc('\r');
+        book8_usb_debug_serial_putc('\n');
+        return false;
+    }
+    uint32_t actual = td_actual_length(status);
+    if (actual != length) {
+        return false;
+    }
+    *toggle ^= 1u;
+    return true;
+}
+
+static bool enumerate_mass_storage(struct uhci_controller *controller,
+    uint8_t port_index, bool low_speed, uint8_t address,
+    bool *address_assigned)
+{
+    *address_assigned = false;
+    uint16_t actual = 0u;
+    uint16_t initial_descriptor_length = low_speed ? 8u : 64u;
+    if (!control_request(controller, low_speed, 0u, 8u, 0x80u, 6u,
+            0x0100u, 0u, descriptor_buffer, initial_descriptor_length, &actual)
+        || actual < 8u) {
+        return false;
+    }
+    uint8_t endpoint_size = descriptor_buffer[7u];
+    if (endpoint_size != 8u && endpoint_size != 16u
+        && endpoint_size != 32u && endpoint_size != 64u) {
+        return false;
+    }
+    bool reset_low_speed = false;
+    if (!reset_port(controller, port_index, &reset_low_speed)
+        || reset_low_speed != low_speed) {
+        return false;
+    }
+    if (!control_request(controller, low_speed, 0u, endpoint_size, 0u,
+            5u, address, 0u, NULL, 0u, NULL)) {
+        return false;
+    }
+    *address_assigned = true;
+    if (!wait_frames(controller->io_base, 2u)) {
+        return false;
+    }
+    if (!control_request(controller, low_speed, address, endpoint_size,
+            0x80u, 6u, 0x0100u, 0u, descriptor_buffer, 18u, &actual)
+        || actual < 18u || descriptor_buffer[1u] != 1u) {
+        return false;
+    }
+    uint16_t configuration_length = 9u;
+    if (!control_request(controller, low_speed, address, endpoint_size,
+            0x80u, 6u, 0x0200u, 0u, descriptor_buffer,
+            configuration_length, &actual) || actual < 9u
+        || descriptor_buffer[1u] != 2u) {
+        return false;
+    }
+    configuration_length = (uint16_t)descriptor_buffer[2u]
+        | ((uint16_t)descriptor_buffer[3u] << 8u);
+    if (configuration_length < 9u
+        || configuration_length > USB_DESCRIPTOR_BUFFER
+        || !control_request(controller, low_speed, address, endpoint_size,
+            0x80u, 6u, 0x0200u, 0u, descriptor_buffer,
+            configuration_length, &actual)
+        || actual < configuration_length) {
+        return false;
+    }
+    uint8_t configuration_value = descriptor_buffer[5u];
+    uint8_t bulk_in = 0u;
+    uint8_t bulk_out = 0u;
+    bool found_mass_storage = false;
+    for (uint32_t offset = 0u; offset + 2u <= configuration_length;) {
+        uint8_t length = descriptor_buffer[offset];
+        uint8_t type = descriptor_buffer[offset + 1u];
+        if (length < 2u || length > configuration_length - offset) {
+            return false;
+        }
+        if (type == 4u && length >= 9u
+            && descriptor_buffer[offset + 3u] == 0u
+            && descriptor_buffer[offset + 5u] == 8u
+            && descriptor_buffer[offset + 6u] == 6u
+            && descriptor_buffer[offset + 7u] == 0x50u) {
+            found_mass_storage = true;
+        } else if (type == 5u && length >= 7u
+            && found_mass_storage
+            && (descriptor_buffer[offset + 3u] & 3u) == 2u) {
+            uint8_t endpoint_address = descriptor_buffer[offset + 2u];
+            if ((endpoint_address & 0x80u) != 0u) {
+                bulk_in = endpoint_address & 0x0fu;
+            } else {
+                bulk_out = endpoint_address & 0x0fu;
+            }
+        }
+        offset += length;
+    }
+    if (!found_mass_storage || bulk_in == 0u || bulk_out == 0u
+        || configuration_value == 0u) {
+        return false;
+    }
+    if (!control_request(controller, low_speed, address, endpoint_size,
+            0u, 9u, configuration_value, 0u, NULL, 0u, NULL)) {
+        return false;
+    }
+    if (!wait_frames(controller->io_base, 10u)) {
+        return false;
+    }
+
+    uint8_t in_toggle = 0u;
+    uint8_t out_toggle = 0u;
+    uint32_t tag = 1u;
+
+    if (false) {
+    /* INQUIRY */
+    for (uint32_t i = 0u; i < 31u; ++i) { cbw_buffer[i] = 0u; }
+    cbw_buffer[0] = 0x55u; cbw_buffer[1] = 0x53u;
+    cbw_buffer[2] = 0x42u; cbw_buffer[3] = 0x43u;
+    cbw_buffer[4] = (uint8_t)tag;
+    cbw_buffer[8] = 36u;
+    cbw_buffer[9] = 0u;
+    cbw_buffer[10] = 0u; cbw_buffer[14] = 6u;
+    cbw_buffer[12] = 0x80u;
+    cbw_buffer[15] = 0x12u;
+    cbw_buffer[19] = 36u;
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_out,
+            USB_PID_OUT, cbw_buffer, 31u, &out_toggle)) {
+        usb_storage_log("USB-STORAGE: CBW INQUIRY failed\r\n");
+        return false;
+    }
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, bulk_buffer, 36u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: INQUIRY data failed\r\n");
+        return false;
+    }
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, csw_buffer, 13u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: INQUIRY CSW failed\r\n");
+        return false;
+    }
+    usb_storage_log("USB-STORAGE: INQUIRY CSW status byte XXX");
+    descriptor_log_hex32(csw_buffer[12]);
+    book8_usb_debug_serial_putc('\r');
+    book8_usb_debug_serial_putc('\n');
+    if (csw_buffer[12] != 0u) {
+        usb_storage_log("USB-STORAGE: INQUIRY status bad");
+        return false;
+    }
+    }
+
+    if (false) {
+    wait_frames(controller->io_base, 50u);
+    /* TEST UNIT READY */
+    for (uint32_t i = 0u; i < 31u; ++i) { cbw_buffer[i] = 0u; }
+    cbw_buffer[0] = 0x55u; cbw_buffer[1] = 0x53u;
+    cbw_buffer[2] = 0x42u; cbw_buffer[3] = 0x43u;
+    cbw_buffer[4] = (uint8_t)(tag + 1u);
+    cbw_buffer[10] = 0u; cbw_buffer[14] = 6u;
+    cbw_buffer[15] = 0x00u;
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_out,
+            USB_PID_OUT, cbw_buffer, 31u, &out_toggle)) {
+        usb_storage_log("USB-STORAGE: CBW TUR failed\r\n");
+        return false;
+    }
+    wait_frames(controller->io_base, 50u);
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, csw_buffer, 13u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: TUR CSW failed\r\n");
+        return false;
+    }
+    if (csw_buffer[12] != 0u) {
+        usb_storage_log("USB-STORAGE: device not ready\r\n");
+        return false;
+    }
+    }
+
+    in_toggle = 0u;
+    out_toggle = 0u;
+    /* READ CAPACITY(10) */
+    for (uint32_t i = 0u; i < 31u; ++i) { cbw_buffer[i] = 0u; }
+    cbw_buffer[0] = 0x55u; cbw_buffer[1] = 0x53u;
+    cbw_buffer[2] = 0x42u; cbw_buffer[3] = 0x43u;
+    cbw_buffer[4] = (uint8_t)(tag + 2u);
+    cbw_buffer[8] = 8u;
+    cbw_buffer[9] = 0u;
+    cbw_buffer[10] = 0u; cbw_buffer[14] = 10u;
+    cbw_buffer[12] = 0x80u;
+    cbw_buffer[15] = 0x25u;
+    usb_storage_log("USB-STORAGE: CBW data length bytes follow");
+    descriptor_log_hex32((uint32_t)cbw_buffer[8]
+        | ((uint32_t)cbw_buffer[9] << 8u)
+        | ((uint32_t)cbw_buffer[10] << 16u)
+        | ((uint32_t)cbw_buffer[11] << 24u));
+    book8_usb_debug_serial_putc('\r');
+    book8_usb_debug_serial_putc('\n');
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_out,
+            USB_PID_OUT, cbw_buffer, 31u, &out_toggle)) {
+        usb_storage_log("USB-STORAGE: CBW READ CAPACITY failed\r\n");
+        return false;
+    }
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, bulk_buffer, 8u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: capacity data failed\r\n");
+        return false;
+    }
+    usb_storage_log("USB-STORAGE: capacity TD status follows");
+    descriptor_log_hex32(control_transfer_descriptors[0].status);
+    book8_usb_debug_serial_putc('\r');
+    book8_usb_debug_serial_putc('\n');
+    usb_storage_log("USB-STORAGE: capacity TD buffer follows");
+    descriptor_log_hex32(control_transfer_descriptors[0].buffer);
+    book8_usb_debug_serial_putc('\r');
+    book8_usb_debug_serial_putc('\n');
+    usb_storage_log("USB-STORAGE: capacity data first dword follows");
+    descriptor_log_hex32((uint32_t)bulk_buffer[0]
+        | ((uint32_t)bulk_buffer[1] << 8u)
+        | ((uint32_t)bulk_buffer[2] << 16u)
+        | ((uint32_t)bulk_buffer[3] << 24u));
+    book8_usb_debug_serial_putc('\r');
+    book8_usb_debug_serial_putc('\n');
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, csw_buffer, 13u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: capacity CSW failed\r\n");
+        return false;
+    }
+    uint32_t last_lba = ((uint32_t)bulk_buffer[0] << 24u)
+        | ((uint32_t)bulk_buffer[1] << 16u)
+        | ((uint32_t)bulk_buffer[2] << 8u)
+        | (uint32_t)bulk_buffer[3];
+    uint32_t block_size = ((uint32_t)bulk_buffer[4] << 24u)
+        | ((uint32_t)bulk_buffer[5] << 16u)
+        | ((uint32_t)bulk_buffer[6] << 8u)
+        | (uint32_t)bulk_buffer[7];
+    usb_storage_log("USB-STORAGE: block size follows");
+    descriptor_log_hex32(block_size);
+    book8_usb_debug_serial_putc('\r');
+    book8_usb_debug_serial_putc('\n');
+    if (block_size != 512u) {
+        usb_storage_log("USB-STORAGE: unsupported block size; assuming 512\r\n");
+        block_size = 512u;
+    }
+    usb_storage_log("USB-STORAGE: capacity ");
+    /* Minimal decimal output for LBA count. */
+    char number[16];
+    uint32_t value = last_lba + 1u;
+    uint32_t pos = 0u;
+    if (value == 0u) { number[pos++] = '0'; }
+    char reversed[16];
+    uint32_t rpos = 0u;
+    while (value != 0u) { reversed[rpos++] = (char)('0' + value % 10u); value /= 10u; }
+    while (rpos != 0u) { number[pos++] = reversed[--rpos]; }
+    number[pos] = (char)0;
+    usb_storage_log(number);
+    usb_storage_log(" sectors\r\n");
+
+    wait_frames(controller->io_base, 50u);
+    in_toggle = 0u;
+    out_toggle = 0u;
+    /* READ LBA 0 */
+    for (uint32_t i = 0u; i < 31u; ++i) { cbw_buffer[i] = 0u; }
+    cbw_buffer[0] = 0x55u; cbw_buffer[1] = 0x53u;
+    cbw_buffer[2] = 0x42u; cbw_buffer[3] = 0x43u;
+    cbw_buffer[4] = (uint8_t)(tag + 3u);
+    cbw_buffer[8] = 0u;
+    cbw_buffer[9] = 2u;
+    cbw_buffer[10] = 0u; cbw_buffer[14] = 10u;
+    cbw_buffer[12] = 0x80u;
+    cbw_buffer[15] = 0x28u;
+    cbw_buffer[17] = 0u; cbw_buffer[18] = 0u;
+    cbw_buffer[19] = 0u; cbw_buffer[20] = 0u; /* LBA 0 */
+    cbw_buffer[22] = 0u; cbw_buffer[23] = 1u; /* transfer length 1 */
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_out,
+            USB_PID_OUT, cbw_buffer, 31u, &out_toggle)) {
+        usb_storage_log("USB-STORAGE: CBW READ(10) failed\r\n");
+        return false;
+    }
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, bulk_buffer, 512u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: read data failed\r\n");
+        return false;
+    }
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, csw_buffer, 13u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: read CSW failed\r\n");
+        return false;
+    }
+    if (csw_buffer[12] != 0u) {
+        usb_storage_log("USB-STORAGE: read status bad\r\n");
+        return false;
+    }
+
+    in_toggle = 0u;
+    out_toggle = 0u;
+    /* WRITE LBA 1 */
+    for (uint32_t i = 0u; i < 512u; ++i) {
+        bulk_buffer[i] = (uint8_t)(i ^ 0x5au);
+    }
+    for (uint32_t i = 0u; i < 31u; ++i) { cbw_buffer[i] = 0u; }
+    cbw_buffer[0] = 0x55u; cbw_buffer[1] = 0x53u;
+    cbw_buffer[2] = 0x42u; cbw_buffer[3] = 0x43u;
+    cbw_buffer[4] = (uint8_t)(tag + 4u);
+    cbw_buffer[8] = 0u; cbw_buffer[9] = 2u;
+    cbw_buffer[10] = 0u; cbw_buffer[14] = 10u;
+    cbw_buffer[12] = 0u; /* OUT */
+    cbw_buffer[15] = 0x2au;
+    cbw_buffer[17] = 0u; cbw_buffer[18] = 0u;
+    cbw_buffer[19] = 0u; cbw_buffer[20] = 0u;
+    cbw_buffer[21] = 1u; /* LBA 1 */
+    cbw_buffer[22] = 0u; cbw_buffer[23] = 1u; /* transfer length 1 */
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_out,
+            USB_PID_OUT, cbw_buffer, 31u, &out_toggle)) {
+        usb_storage_log("USB-STORAGE: CBW WRITE failed\r\n");
+        return false;
+    }
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_out,
+            USB_PID_OUT, bulk_buffer, 512u, &out_toggle)) {
+        usb_storage_log("USB-STORAGE: write data failed\r\n");
+        return false;
+    }
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, csw_buffer, 13u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: write CSW failed\r\n");
+        return false;
+    }
+    if (csw_buffer[12] != 0u) {
+        usb_storage_log("USB-STORAGE: write status bad\r\n");
+        return false;
+    }
+
+    in_toggle = 0u;
+    out_toggle = 0u;
+    /* READ BACK LBA 1 */
+    for (uint32_t i = 0u; i < 31u; ++i) { cbw_buffer[i] = 0u; }
+    cbw_buffer[0] = 0x55u; cbw_buffer[1] = 0x53u;
+    cbw_buffer[2] = 0x42u; cbw_buffer[3] = 0x43u;
+    cbw_buffer[4] = (uint8_t)(tag + 5u);
+    cbw_buffer[8] = 0u; cbw_buffer[9] = 2u;
+    cbw_buffer[10] = 0u; cbw_buffer[14] = 10u;
+    cbw_buffer[12] = 0x80u;
+    cbw_buffer[15] = 0x28u;
+    cbw_buffer[17] = 0u; cbw_buffer[18] = 0u;
+    cbw_buffer[19] = 0u; cbw_buffer[20] = 0u;
+    cbw_buffer[21] = 1u; /* LBA 1 */
+    cbw_buffer[22] = 0u; cbw_buffer[23] = 1u; /* transfer length 1 */
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_out,
+            USB_PID_OUT, cbw_buffer, 31u, &out_toggle)) {
+        usb_storage_log("USB-STORAGE: CBW READBACK failed\r\n");
+        return false;
+    }
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, bulk_buffer, 512u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: readback data failed\r\n");
+        return false;
+    }
+    if (!uhci_bulk_transfer(controller, low_speed, address, bulk_in,
+            USB_PID_IN, csw_buffer, 13u, &in_toggle)) {
+        usb_storage_log("USB-STORAGE: readback CSW failed\r\n");
+        return false;
+    }
+    for (uint32_t i = 0u; i < 512u; ++i) {
+        if (bulk_buffer[i] != (uint8_t)(i ^ 0x5au)) {
+            usb_storage_log("USB-STORAGE: readback mismatch\r\n");
+            return false;
+        }
+    }
+    usb_storage_log("USB-STORAGE: read/write PASS\r\n");
+    return true;
+}
+
 static bool enumerate_hid(struct uhci_controller *controller,
     uint8_t port_index, bool low_speed, uint8_t address,
     bool *address_assigned)
@@ -2104,8 +2521,11 @@ static bool initialize_controller(struct uhci_controller *controller)
             continue;
         }
         bool address_assigned = false;
-        (void)enumerate_hid(controller, port, low_speed, next_address,
-            &address_assigned);
+        if (!enumerate_mass_storage(controller, port, low_speed,
+                next_address, &address_assigned)) {
+            (void)enumerate_hid(controller, port, low_speed, next_address,
+                &address_assigned);
+        }
         if (address_assigned) {
             ++next_address;
         }

@@ -189,6 +189,17 @@ static void hda_api_get_stream_info(struct hda_stream_info *info)
         hda_stream_get_info(&hda_playback, info);
 }
 
+static int32_t hda_api_get_pcm_window(struct b8_hda_pcm_window *window)
+{
+    if (window == NULL || !hda_playback.loaded) {
+        return -BOOK8_EINVAL;
+    }
+    window->pcm = hda_playback.pcm;
+    window->size = hda_playback.pcm_size;
+    window->position_bytes = hda_playback.played_bytes;
+    return 0;
+}
+
 static int32_t hda_api_service(void)
 {
     return (int32_t)hda_stream_service(&hda_platform, &hda_controller,
@@ -226,10 +237,16 @@ static const struct b8_hda_module_api hda_module_api = {
 
 static int32_t hda_module_ioctl(uint32_t command, void *argument)
 {
-    if (command != B8_HDA_IOCTL_GET_API || argument == NULL)
+    if (argument == NULL)
         return -BOOK8_EINVAL;
-    *(const struct b8_hda_module_api **)argument = &hda_module_api;
-    return 0;
+    if (command == B8_HDA_IOCTL_GET_API) {
+        *(const struct b8_hda_module_api **)argument = &hda_module_api;
+        return 0;
+    }
+    if (command == B8_HDA_IOCTL_GET_PCM_WINDOW) {
+        return hda_api_get_pcm_window((struct b8_hda_pcm_window *)argument);
+    }
+    return -BOOK8_EINVAL;
 }
 
 static const b8_driver_t hda_module_descriptor = {

@@ -23,13 +23,69 @@
 #define SYS_draw_pixel 62
 #define SYS_hwdiag   63
 #define SYS_gui_utility 64
-#define SYS_MAX     65 /* exclusive upper bound of the dispatch table */
+#define SYS_spawn    65 /* start a background user task */
+#define SYS_yield    66 /* voluntary CPU yield from a user task */
+#define SYS_ipc_open 67 /* bind or open a kernel IPC port */
+#define SYS_ipc_close 68 /* release an owned IPC port */
+#define SYS_ipc_send 69 /* send a bounded message to an IPC port */
+#define SYS_ipc_recv 70 /* receive a bounded message from an IPC port */
+#define SYS_MAX     71 /* exclusive upper bound of the dispatch table */
+
+/* Kernel IPC ports. Port 1 is reserved for kernel -> user event delivery and
+ * may be received by any task; all other ports are owned by the creating pid. */
+#define BOOK8_IPC_KERNEL_PORT 1u
+#define BOOK8_IPC_KERNEL_OWNER 0xffffffffu /* never assigned to a user pid */
+#define BOOK8_IPC_PORT_COUNT  32u
+#define BOOK8_IPC_QUEUE_SIZE  8u
+#define BOOK8_IPC_MESSAGE_MAX 256u
+
+/* SYS_ipc_open flags. */
+#define BOOK8_IPC_CREATE 0x1u
+#define BOOK8_IPC_EXCL   0x2u
+/* SYS_ipc_recv flags. BOOK8_IPC_NOWAIT is currently the only supported mode;
+ * blocking waits are expressed as a user-side poll plus SYS_yield. */
+#define BOOK8_IPC_NOWAIT 0x1u
+
+/* ------------------------------------------------------------
+ * Architecture stabilization guards.
+ * Changes to these constants, struct layouts, or enum values
+ * require a full rebuild and test matrix to avoid ABI breakage.
+ * ------------------------------------------------------------ */
+
+/* Maximum number of GUI program-registry slots, including system
+   components seeded at boot. This guard prevents silent overflow of the
+   registered_programs array when new ELFs are added. */
+#define BOOK8_MAX_PROGRAMS 512u
+
+/* GUI utility kinds passed to SYS_gui_utility (RAX=64).
+   Each kind maps to a specific ELF launcher in A:\BIN\ via
+   utility_path(), and the corresponding app_class in src/book8gui.c.
+   The kernel seeds the registry in registry_seed_defaults() (kernel.c).
+   KIND VALUES MUST NOT BE REORDERING OR REASSIGNED without also
+   updating utility_path(), book8gui_program_info(), and the
+   programs_menu[] array in src/book8gui.c.
+   Registry program indices are frozen at boot; adding new user
+   programs beyond BOOK8_MAX_PROGRAMS requires a kernel rebuild. */
+
+/* 1 = Hex Viewer: views binary files; ELF: A:\BIN\HEXVIEW.ELF */
 #define BOOK8_GUI_HEXVIEW 1u
+
+/* 2 = Code Editor: plain-text editor; ELF: A:\BIN\CODEEDIT.ELF */
 #define BOOK8_GUI_CODEEDIT 2u
+
+/* 3 = Network Share Browser: LAN file browser; ELF: A:\BIN\NETSHARE.ELF */
 #define BOOK8_GUI_NETSHARE 3u
+
+/* 4 = PaintBook: bitmap drawing app; ELF: A:\BIN\PAINTBK.ELF */
 #define BOOK8_GUI_PAINTBOOK 4u
+
+/* 5 = Web Browser: HTTP/html client; ELF: A:\BIN\BROWSER.ELF */
 #define BOOK8_GUI_BROWSER 5u
+
+/* 6 = NV Diagnostic: hardware register dump; ELF: A:\BIN\NVDIAG.ELF */
 #define BOOK8_GUI_NVDIAG 6u
+
+/* 7 = BOOK8 Player: VLC-style player; built-in app class, no user ELF */
 #define BOOK8_GUI_PLAYER 7u
 
 #define BOOK8_EPERM    1
@@ -43,6 +99,7 @@
 #define BOOK8_ENODEV   19
 #define BOOK8_EINVAL   22
 #define BOOK8_EMFILE   24
+#define BOOK8_EEXIST   17
 #define BOOK8_ENOSYS   38
 #define BOOK8_ENOTSUP  95
 
@@ -169,6 +226,14 @@ long sys_open(const char *path, int flags);
 long sys_close(int fd);
 /* Replaces the process image; returns only on failure. argv is NULL-terminated. */
 long sys_execve(const char *path, char *const argv[], char *const envp[]);
+/* Starts another user task in the unified task/privilege model. */
+long sys_spawn(const char *path, char *const argv[]);
+long sys_yield(void);
+/* Bounded kernel <-> user IPC. Returns 0 or a message length on success. */
+long sys_ipc_open(uint32_t port, uint32_t flags);
+long sys_ipc_close(uint32_t port);
+long sys_ipc_send(uint32_t port, const void *data, uint32_t size);
+long sys_ipc_recv(uint32_t port, void *data, uint32_t capacity, uint32_t flags);
 __attribute__((noreturn)) void sys_exit(int status);
 
 #endif /* __ASSEMBLER__ */

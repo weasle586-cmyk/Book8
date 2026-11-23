@@ -1,0 +1,347 @@
+Phase 1 Bare-Metal Validation Specification
+NV Maxwell / BOOK8 Driver Bring-Up — No Code Changes
+This defines the validation matrix and telemetry capture requirements for Phase 1. It is a specification only; no repository changes, builds, or commits are required.
+
+1. Phase 1 scope and non-goals
+In scope
+Validate the existing NV Maxwell driver on real GM204 hardware.
+Validate PCI enumeration, BAR mapping, PMC/PFB discovery, scanout adoption, PFIFO/channel bring-up, CE self-test, and acceleration entry/exit.
+Validate RS780/PCIe prerequisite behavior on the target platform.
+Capture enough evidence to decide whether each unverified register operation is safe.
+Out of scope
+NV902D graphics-engine methods.
+Display-controller modesetting.
+Lane/power-gating writes.
+New acceleration features or driver refactors.
+Committing or changing source code.
+
+
+2. Required target hardware
+Minimum target
+GPU: NVIDIA GTX 970 (10DE:13C2) or GTX 980 (10DE:13C0).
+Motherboard/chipset: AMD RS780 / 780G-class target, matching BOOK8’s validated RS780 path.
+CPU: AMD Family 15h-class or compatible target used by the existing PCIe validation.
+Display: monitor connected to the NVIDIA card, with known native resolution and pitch.
+Serial: physical COM1 capture at 115200 8N1.
+Storage: BOOK8 boot media and a writable data image.
+Preferred additional hardware
+Second GPU sample of the same model, if available.
+A second monitor resolution for scanout validation.
+A PCIe analyzer or POST card only if already available; not required for Phase 1.
+Hardware inventory to record
+GPU model, VBIOS version, PCI BDF, BAR0/BAR1 physical addresses and sizes.
+Motherboard model, BIOS/UEFI version.
+CPU model and family.
+Monitor model, native resolution, refresh rate.
+Installed RAM size and layout.
+Storage device model and capacity.
+
+
+3. Firmware and platform matrix
+ID	Firmware / platform setting	Values to test	Purpose
+FW-1	Boot mode	UEFI, Legacy/CSM	Validate PCIe ECAM, BAR mapping, framebuffer handoff
+FW-2	Above 4G decoding	Enabled, Disabled	Validate BAR1 placement and identity-map assumptions
+FW-3	Resizable BAR / SAM	Enabled if available, Disabled	Validate BAR1 aperture behavior
+FW-4	IOMMU	Enabled, Disabled	Detect DMA/address-translation effects
+FW-5	Fast Boot / GOP	Enabled, Disabled	Validate firmware-initialized scanout
+FW-6	CSM video	Enabled, Disabled	Validate legacy VGA vs UEFI GOP handoff
+FW-7	Secure Boot	Disabled required for BOOK8 module/driver trust baseline	Avoid unrelated boot failures
+FW-8	PCIe link speed/gen	Auto, Gen2, Gen3 if selectable	Validate RS780 link stability
+Required minimum
+At least one UEFI boot and one Legacy/CSM boot.
+At least one Above-4G-enabled and one Above-4G-disabled configuration if the firmware supports it.
+At least one IOMMU-enabled and one IOMMU-disabled configuration if supported.
+
+
+
+4. BOOK8 boot configuration matrix
+ID	Build / boot option	Values	Purpose
+CFG-1	BOOK8_NV_BIND_CHANNEL	0, 1	Compare probe-only vs channel bind
+CFG-2	BOOK8_NV_DRIVER_MODULE	module build vs linked build	Validate module loading path
+CFG-3	book8.net	off, DHCP/static	Isolate network telemetry noise
+CFG-4	book8.splash	0	Keep serial logs readable
+CFG-5	Diagnostic image	normal, NV diagnostic	Validate diagnostic UI and capture path
+CFG-6	Resolution	firmware/native, one alternate	Validate scanout pitch/size
+CFG-7	Telemetry	enabled, disabled	Validate no-regression when telemetry off
+Required minimum
+Probe-only build: BOOK8_NV_BIND_CHANNEL=0.
+Channel-bind build: BOOK8_NV_BIND_CHANNEL=1.
+At least one run with book8.net=off.
+At least one NV diagnostic boot.
+
+
+
+5. Display and scanout matrix
+ID	Scanout condition	Values	Purpose
+DISP-1	Resolution	native, one lower resolution	Validate pitch and surface size
+DISP-2	Color depth	32-bit only initially	Match current driver assumption
+DISP-3	Scanout VRAM offset	firmware-reported base	Validate nv_adopt_scanout
+DISP-4	Pitch alignment	native pitch, padded pitch if selectable	Validate PTE and cache behavior
+DISP-5	Monitor connection	single monitor	Avoid multi-head complexity
+DISP-6	Hotplug	no hotplug during Phase 1	Keep bring-up deterministic
+Required scanout checks
+Boot framebuffer physical base is below the BAR1 256 MiB identity map.
+Scanout pitch × height fits below NV_CH_FB_MAX.
+BAR1 PTEs for the scanout range verify successfully.
+CPU framebuffer access remains valid after BAR1 bind/unbind.
+
+
+
+6. NV bring-up test scenarios
+Each scenario must be run separately and logged.
+
+ID	Scenario	Build option	Expected outcome
+NV-0	PCI enumeration only	BOOK8_NV_BIND_CHANNEL=0	GPU present, BARs discovered, command bits verified
+NV-1	BAR0 mapping	0	BAR0 mapped uncached, PMC_BOOT_0 reports GM204
+NV-2	BAR1 mapping	0	BAR1 mapped, size and physical range valid
+NV-3	Telemetry refresh	0	PMC/PFB values reported without fault
+NV-4	Engine discovery	0	PTOP parsed, CE discovered or clearly absent
+NV-5	Scanout adoption	0	Scanout valid, VRAM offset recorded
+NV-6	Channel bind	1	Bind either succeeds or reports exact failing stage
+NV-7	Ring acknowledgment	1	PFIFO advances GP_GET after NOP
+NV-8	CE self-test	1	Fill and copy match CPU reference
+NV-9	Acceleration smoke	1	nv_accel_ready() true only after self-test
+NV-10	CPU fallback	0 and 1	Desktop remains usable if acceleration unavailable
+NV-11	Teardown	1	Unbind restores BAR1, PRAMIN, PMC, runlist, and channel state
+NV-12	Repeated bind/unbind	1	No leaked state or stale diagnostics
+NV-13	Fence timeout handling	1	If timeout occurs, acceleration disables and CPU fallback works
+NV-14	Long-duration run	1	No fence timeouts or channel errors during normal desktop use
+Abort conditions
+Stop the run immediately if any of the following occur:
+
+PCI command readback is 0xFFFFFFFF.
+BAR0 or BAR1 mapping causes a #GP, #PF, or system hang.
+PMC_BOOT_0 is invalid or non-GM204.
+BAR1 bind disturbs CPU framebuffer access.
+A fence timeout causes a hang rather than a clean disable.
+Teardown leaves the system unstable.
+
+
+
+
+7. RS780 / PCIe prerequisite scenarios
+ID	Scenario	Expected outcome
+PCIE-1	Normal boot on target	RS780 L0 observed before command assertion
+PCIE-2	PCIEPROBE A5	LTSSM status readable
+PCIE-3	PCIEPROBE A2	Link width readable
+PCIE-4	Manual audit IDs 1–6	Each access individually acknowledged
+PCIE-5	PM state variation	D0 prerequisite behavior documented
+PCIE-6	Missing/unassigned BAR	BAR access blocked, no guessed addresses
+Required evidence
+Serial log showing RS780 L0 result.
+PCI config dump for 00:00.0, 00:02.0, and 01:00.0.
+BAR0/BAR1 base, size, and command register values.
+Manual audit result IDs and any recovery state.
+
+
+
+8. Telemetry capture requirements
+Serial capture
+Capture COM1 from power-on/reset until shell is stable.
+Use 115200 8N1.
+Capture both raw serial and timestamped serial.
+Preserve carriage returns and line endings.
+Do not filter or trim output during capture.
+Required log artifacts per run
+Artifact	Format	Retention
+Raw serial log	.log	Permanent
+Timestamped serial log	.log or .csv	Permanent
+Boot marker summary	.txt	Permanent
+Hardware inventory	.txt or .json	Permanent
+PCI config dump	.txt	Permanent
+NV telemetry snapshot	.txt	Permanent
+Screenshot before acceleration	PPM/PNG	Permanent
+Screenshot after acceleration	PPM/PNG	Permanent
+Build identifier	text	Permanent
+Git commit / source state	text	Permanent
+Required marker capture
+At minimum, capture and index these markers:
+
+BOOK8-BOOT: initialization complete; entering shell
+PCIE1 lines
+BOOK8-NV: lines
+NVDRV: lines
+BOOK8-ABOUT: lines if diagnostic UI is used
+Any #GP, #PF, page fault, or panic text
+Any Cannot open file, buffer limit, or utility failure text
+Required telemetry fields per NV run
+Field	Source	Required
+GPU present	PCI enumeration	Yes
+GPU mapped	nv_map_bars	Yes
+Device ID	PMC_BOOT_0 / PCI config	Yes
+Chipset	PMC_BOOT_0	Yes
+BAR0 base/size	PCI config	Yes
+BAR1 base/size	PCI config	Yes
+PMC_ENABLE	MMIO read	Yes
+PFB_CONFIG	MMIO read	Yes
+PFB_CSTATUS	MMIO read	Yes
+Detected VRAM MB	driver telemetry	Yes
+PDISP head mask	driver telemetry	Yes
+Scanout valid	driver state	Yes
+Scanout physical base	driver state	Yes
+Scanout VRAM offset	driver state	Yes
+Scanout width/height/pitch	driver state	Yes
+CE found	PTOP discovery	Yes
+CE count	PTOP discovery	Yes
+Runlist ID	PTOP discovery	Yes
+Channel bound	driver state	Yes
+Ring acked	driver state	Yes
+Runlist committed	driver state	Yes
+Acceleration ready	nv_accel_ready()	Yes
+Acceleration failed	driver state	Yes
+Bind failure stage	bind_fail	Yes if bind fails
+Fence sequence	driver state	Yes
+Fence timeout count	driver stats	Yes
+GPU fill count	driver stats	Yes
+GPU copy count	driver stats	Yes
+Small skip count	driver stats	Yes
+Unsupported count	driver stats	Yes
+BAR1 bind saved value	driver state	Yes
+PRAMIN saved value	driver state	Yes
+PMC interrupt enable saved value	driver state	Yes
+PFIFO channel control/instance saved values	driver state	Yes
+Timing requirements
+Record boot-to-shell time.
+Record time from channel bind start to bind result.
+Record fence wait duration or timeout.
+Record CE self-test duration.
+If a timeout occurs, record the last submitted operation and fence sequence.
+Log naming convention
+Use one directory per run:
+
+build/nv-phase1/<run-id>/
+  hardware-inventory.txt
+  firmware-settings.txt
+  serial-raw.log
+  serial-timestamped.log
+  marker-summary.txt
+  pci-config.txt
+  nv-telemetry.txt
+  screenshot-before.ppm
+  screenshot-after.ppm
+  build-id.txt
+  source-state.txt
+run-id should include:
+
+GPU model
+boot mode
+Above-4G setting
+IOMMU setting
+resolution
+BIND0 or BIND1
+run number
+Example:
+
+gtx970-uefi-above4g-on-iommu-off-1920x1080-bind1-run01
+
+
+
+
+9. Required diagnostic commands and manual checks
+During each run, capture the output of:
+
+HELP
+PCIEPROBE A2
+PCIEPROBE A5
+NVDIAG or equivalent NVIDIA diagnostic UI
+HWDIAG if available
+Any NV-specific shell command available in that build
+Manual audit requirements
+If using the RS780 manual audit API:
+
+Complete IDs 1 through 6.
+Acknowledge each INTENT and RESULT separately.
+Record every failure and recovery state.
+Do not call finish until all six IDs are complete.
+Hardware verification requirements
+Verify BAR0/BAR1 physical addresses against lspci -vv or firmware output.
+Verify BAR sizes against the device’s actual aperture.
+Verify scanout base and pitch against the bootloader framebuffer handoff.
+Verify that no BAR address overlaps kernel, modules, framebuffer, or TFTP staging.
+
+
+
+
+
+10. Pass/fail criteria
+Phase 1 pass criteria
+Phase 1 is considered successful if:
+
+At least one complete probe-only run succeeds.
+At least one complete channel-bind run reaches a clearly reported terminal state.
+BAR0 and BAR1 mappings are validated.
+PMC_BOOT_0 reports GM204.
+Scanout adoption succeeds or fails with a named stage.
+CE self-test either passes or fails with diagnostic evidence.
+Teardown leaves the system stable in every run.
+No hang, #GP, #PF, or framebuffer corruption occurs.
+All required artifacts are captured.
+Phase 1 partial-success criteria
+Phase 1 is partially successful if:
+
+Probe-only validation passes.
+Channel bind fails at a named, reproducible stage.
+The failing stage is documented with register values and telemetry.
+CPU fallback remains functional.
+This is acceptable for Phase 1 because the purpose is validation, not guaranteed acceleration.
+
+Phase 1 fail criteria
+Phase 1 fails if:
+
+A run hangs.
+A #GP or #PF is not recovered.
+BAR mapping corrupts framebuffer or system state.
+Teardown destabilizes the system.
+Required telemetry is missing.
+Results are not reproducible enough to identify the failing stage.
+
+
+
+11. Evidence retention and review requirements
+Required review checklist
+For each run, reviewers must be able to answer:
+
+Which GPU and firmware configuration were used?
+Did PCI enumeration succeed?
+Were BAR0 and BAR1 mapped?
+Did PMC_BOOT_0 report GM204?
+Was scanout valid?
+Did channel bind reach a terminal state?
+If bind failed, which stage failed?
+Did ring acknowledgment occur?
+Did CE self-test pass?
+Did acceleration become ready?
+Did teardown restore all saved state?
+Did CPU fallback remain usable?
+Are all required artifacts present?
+Required comparison
+Compare results across:
+
+UEFI vs Legacy
+Above 4G on vs off
+IOMMU on vs off
+Different resolutions
+GTX 970 vs GTX 980, if both are available
+Required conclusions from Phase 1
+At the end of Phase 1, produce a report stating:
+
+Which configurations are safe.
+Which register operations are validated.
+Which operations remain unverified.
+Whether channel binding should remain opt-in.
+Whether CE acceleration should be enabled by default.
+What Phase 2 should change, if anything.
+
+
+
+
+12. Phase 1 exit criteria
+Phase 1 is complete when:
+
+The full matrix has been executed or explicitly scoped down with documented reasons.
+Every run has a complete artifact directory.
+A pass/fail/partial-success verdict exists for each configuration.
+The failing stage, if any, is identified and reproducible.
+No code changes are required to interpret the results.
+A written Phase 1 report exists.
+A Phase 2 plan can be derived from the evidence.

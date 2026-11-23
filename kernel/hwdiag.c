@@ -33,6 +33,38 @@ static uint32_t config_read(uint8_t offset)
         device->slot, device->function, offset);
 }
 
+/* Read-only walk of the conventional PCI capability chain. Returns the
+ * dword-aligned config offset of the requested capability, or 0 if absent or
+ * the chain is malformed. */
+static uint8_t pci_capability(uint8_t cap_id)
+{
+    uint32_t status = config_read(4u);
+    if (status == UINT32_MAX || (status & (1u << 20u)) == 0u) {
+        return 0u;
+    }
+    if (((config_read(0x0cu) >> 16u) & 0x7fu) != 0u) {
+        return 0u;
+    }
+    uint8_t offset = (uint8_t)(config_read(0x34u) & 0xffu);
+    uint64_t visited = 0u;
+    while (offset != 0u) {
+        if (offset < 0x40u || offset > 0xf8u || (offset & 3u) != 0u) {
+            return 0u;
+        }
+        uint64_t bit = 1ull << (offset >> 2u);
+        if ((visited & bit) != 0u) {
+            return 0u;
+        }
+        visited |= bit;
+        uint32_t cap = config_read(offset);
+        if ((cap & 0xffu) == cap_id) {
+            return offset;
+        }
+        offset = (uint8_t)((cap >> 8u) & 0xffu);
+    }
+    return 0u;
+}
+
 static long register_accessible(void);
 
 static bool snapshot_register(struct book8_nvdiag_snapshot *snapshot,
@@ -79,6 +111,14 @@ long hwdiag_snapshot(struct book8_nvdiag_snapshot *snapshot)
     snapshot->scanout_width = device->scanout.width;
     snapshot->scanout_height = device->scanout.height;
     snapshot->scanout_pitch = device->scanout.pitch;
+    snapshot->chip_revision = device->chip_rev;
+    snapshot->foundry_id = device->foundry_id;
+    snapshot->detected_vram_mb = device->detected_vram_mb;
+    snapshot->pfb_config = device->pfb_config;
+    snapshot->pdisp_head_mask = device->pdisp_head_mask;
+    snapshot->pdisp_active_head = device->pdisp_active_head;
+    snapshot->pdisp_htotal = device->pdisp_htotal;
+    snapshot->pdisp_vtotal = device->pdisp_vtotal;
     snapshot->pushbuf_put = device->put;
     snapshot->pushbuf_words = device->pushbuf_words;
     snapshot->pushbuf_used = device->put >= device->seg_start
@@ -114,6 +154,14 @@ long hwdiag_snapshot(struct book8_nvdiag_snapshot *snapshot)
     snapshot->pci_id = pci_id;
     snapshot->bdf = ((uint32_t)device->bus << 8u)
         | ((uint32_t)device->slot << 3u) | device->function;
+    snapshot->rom_bar = config_read(0x30u);
+    uint8_t pcie = pci_capability(0x10u);
+    if (pcie != 0u) {
+        snapshot->flags |= BOOK8_NVDIAG_PCI_EXPRESS;
+        snapshot->pcie_link_cap = config_read((uint8_t)(pcie + 0x0cu));
+        uint32_t link = config_read((uint8_t)(pcie + 0x10u));
+        snapshot->pcie_link_status = (link >> 16u) & 0xffffu;
+    }
     uint32_t command_status = config_read(4u);
     if (command_status != UINT32_MAX) {
         snapshot->pci_command = command_status & 0xffffu;

@@ -13,7 +13,9 @@ import tempfile
 import time
 from pathlib import Path
 
-BOOT_MESSAGE = "BOOK8 x86-64 command interpreter"
+import qemu_ui_lookup as ui
+import ui_geometry as geo
+
 FRAMEBUFFER_PATTERN = re.compile(
     r"BOOK8 framebuffer handoff:\s*(\d+)x(\d+)x(?:24|32)"
 )
@@ -34,6 +36,7 @@ def available_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
 
 def screenshot_region(monitor, path, x, y, width, height):
     time.sleep(1)
@@ -154,8 +157,8 @@ def main():
         args = [
             os.environ.get("QEMU", "qemu-system-x86_64"),
             "-machine", "pc", "-m", "512M",
-            "-device", "piix3-usb-uhci,id=uhci",
-            "-device", "usb-mouse,bus=uhci.0",
+            "-device", "pci-ohci,id=ohci",
+            "-device", "usb-mouse,bus=ohci.0",
             "-cdrom", str(iso), "-boot", "d",
             "-drive", f"file={image},format=raw,if=ide,index=0,snapshot=on",
             "-display", "none", "-vga", "std",
@@ -167,23 +170,33 @@ def main():
         process = subprocess.Popen(args, stderr=stderr_file)
         monitor = None
         try:
-            wait_for_text(serial, BOOT_MESSAGE, 90)
-            wait_for_text(serial, "USB HID mouse active", 20)
-            monitor = QemuMonitor(port, process)
-
-            # Clean boot: only the taskbar is reserved, no windows autostart.
-            log = wait_for_text(serial, "BOOK8-DESKTOP: TASKBAR height=36 reserved")
-            if "BOOK8-DESKTOP: WINDOW id=" in log:
-                raise AssertionError("A window auto-started on the clean desktop")
-            monitor.reset_pointer()
-
-            log = wait_for_text(serial, "BOOK8 framebuffer handoff:")
+            log = wait_for_text(serial, "BOOK8 framebuffer handoff:", 90)
             match = FRAMEBUFFER_PATTERN.search(log)
             if match is None:
                 raise AssertionError("Framebuffer handoff dimensions not found")
             width, height = map(int, match.groups())
+            monitor = QemuMonitor(port, process)
             monitor.set_screen_size(width, height)
-            taskbar_y = height - 18
+
+            # The graphical ISO autostarts the desktop, which begins with a
+            # modal sign-in window. The interpreter banner and USB status line
+            # are only printed after the GUI exits, so they are not boot
+            # markers here.
+            wait_for_text(serial, "BOOK8-DESKTOP: TASKBAR height=36 reserved", 30)
+            wait_for_text(serial,
+                'BOOK8-DESKTOP: WINDOW id=1 title="BOOK8 Sign In" registered', 30)
+            monitor.type_text("default")
+            wait_for_text(serial, "BOOK8-SESSION: login accepted uid=0", 20)
+            wait_for_text(serial,
+                'BOOK8-DESKTOP: WINDOW closed id=1 title="BOOK8 Sign In"', 10)
+            # Calibrate the relative USB pointer only after the GUI's mouse
+            # polling is running; moves sent before this are discarded.
+            monitor.reset_pointer()
+            taskbar_y = height - geo.TASKBAR_START_Y_OFFSET
+            # The autostart sign-in modal consumes cascade slot 0. User windows
+            # therefore start one 24 px step down/right from their nominal
+            # positions, matching the other QEMU desktop tests.
+            cascade_step = 24
 
             monitor.command(f"screendump {screenshot}")
             deadline = time.monotonic() + 10
@@ -195,46 +208,48 @@ def main():
             if not header.startswith(b"P6"):
                 raise AssertionError("QEMU desktop screenshot is not PPM")
 
-            # Start menu geometry mirrors src/book8gui.c (20 px rows, 2 px gaps).
-            top = height - 36
-            root_y = top - 2 - 64
-            programs_y = root_y + 2 + 10
-            settings_y = root_y + 2 + 20 + 10
-            # Data fixture: four built-ins + two root apps + three utilities.
-            sub_y = min(root_y, top - 2 - (9 * 20 + 4))
-            explorer_y = sub_y + 2 + 10
-            shell_y = sub_y + 2 + 20 + 10
-            editor_y = sub_y + 2 + 2 * 20 + 10
-            taskmgr_y = sub_y + 2 + 3 * 20 + 10
+            # Start menu geometry is frozen in tests/ui_geometry.py; row
+            # identity is resolved dynamically from PROGRAM-MENU-ROW lines.
+            programs_y = ui.root_row_y(height, 0)
+            settings_y = ui.root_row_y(height, 1)
+            # Resolve Programs entries by name; registered apps change row order.
+            rows = ui.await_program_rows(serial, process, timeout=20)
+            row_count = len(rows)
+            def program_y(label):
+                return ui.row_y(height, ui.resolve_row(serial, label=label), row_count)
+            explorer_y = program_y("File Explorer")
+            shell_y = program_y("Command Shell")
+            editor_y = program_y("NoteEditor")
+            taskmgr_y = program_y("Task Manager")
             monitor.click(20, taskbar_y)
             monitor.click(40, programs_y)
             monitor.click(200, explorer_y)
             wait_for_text(serial,
-                'BOOK8-DESKTOP: WINDOW id=1 title="File Explorer" registered', 5)
+                'BOOK8-DESKTOP: WINDOW id=2 title="File Explorer" registered', 5)
             monitor.click(20, taskbar_y)
             monitor.click(40, programs_y)
             monitor.click(200, editor_y)
             wait_for_text(serial,
-                'BOOK8-DESKTOP: WINDOW id=2 title="NoteEditor" registered', 5)
+                'BOOK8-DESKTOP: WINDOW id=3 title="NoteEditor" registered', 5)
             monitor.click(20, taskbar_y)
             monitor.click(40, programs_y)
             monitor.click(200, shell_y)
             wait_for_text(serial,
-                'BOOK8-DESKTOP: WINDOW id=3 title="Command Shell" registered', 5)
-            monitor.click(300, 150)
+                'BOOK8-DESKTOP: WINDOW id=4 title="Command Shell" registered', 5)
+            monitor.click(300 + 3 * cascade_step, 150 + 3 * cascade_step)
             wait_for_text(serial,
-                "BOOK8-DESKTOP: input routed id=3 type=mouse-click", 5)
+                "BOOK8-DESKTOP: input routed id=4 type=mouse-click", 5)
 
             monitor.type_text("inputstat")
             log = wait_for_text(serial, "BOOK8-INPUT:")
             monitor.click(104, taskbar_y)
             wait_for_text(serial,
-                'BOOK8-DESKTOP: focus id=1 title="File Explorer"')
-            monitor.click(60, 131)
+                'BOOK8-DESKTOP: focus id=2 title="File Explorer"')
+            monitor.click(60 + cascade_step, 131 + cascade_step)
             time.sleep(0.08)
-            monitor.click(60, 131)
+            monitor.click(60 + cascade_step, 131 + cascade_step)
             log = wait_for_text(serial, "BOOK8-EXPLORER: path=A:\\DATA\\")
-            if "BOOK8-DESKTOP: input routed id=1 type=mouse-click" not in log:
+            if "BOOK8-DESKTOP: input routed id=2 type=mouse-click" not in log:
                 raise AssertionError("Explorer click was not routed to its window")
 
             input_lines = re.findall(r"BOOK8-INPUT:[^\r\n]+", log)
@@ -252,13 +267,13 @@ def main():
                     f"USB mouse input counters are not clean: {input_lines[-1]}"
                 )
 
-            # Explorer sits at (40,40), 300 px wide: min/max/close buttons.
-            monitor.click(285, 55)
-            wait_for_text(serial, "BOOK8-DESKTOP: WINDOW minimized id=1", 5)
+            # Explorer is cascaded to (64,64), 300 px wide: min/max buttons.
+            monitor.click(285 + cascade_step, 55 + cascade_step)
+            wait_for_text(serial, "BOOK8-DESKTOP: WINDOW minimized id=2", 5)
             monitor.click(104, taskbar_y)
-            wait_for_text(serial, "BOOK8-DESKTOP: WINDOW restored id=1", 5)
-            monitor.click(305, 55)
-            wait_for_text(serial, "BOOK8-DESKTOP: WINDOW maximized id=1", 5)
+            wait_for_text(serial, "BOOK8-DESKTOP: WINDOW restored id=2", 5)
+            monitor.click(305 + cascade_step, 55 + cascade_step)
+            wait_for_text(serial, "BOOK8-DESKTOP: WINDOW maximized id=2", 5)
             time.sleep(1)
             monitor.command(f"screendump {temp_path / 'maximized.ppm'}", 0.3)
             ppm = (temp_path / "maximized.ppm").read_bytes().split(b"\n", 3)
@@ -285,17 +300,20 @@ def main():
                 monitor.command("sendkey ret", 0.12)
             monitor.move_to(100, 150)
             before = screenshot_region(monitor, temp_path / "wheel-before.ppm",
-                                       71, 117, 520, 272)
+                                       71 + 2 * cascade_step,
+                                       117 + 2 * cascade_step, 520, 272)
             monitor.command("mouse_move 0 0 1", 0.3)
             wait_for_text(serial, " WHEEL=1 ", 5)
             scrolled = screenshot_region(monitor, temp_path / "wheel-up.ppm",
-                                         71, 117, 520, 272)
+                                         71 + 2 * cascade_step,
+                                        117 + 2 * cascade_step, 520, 272)
             if scrolled == before:
                 raise AssertionError("Wheel up did not move editor content")
             monitor.command("mouse_move 0 0 -1", 0.3)
             wait_for_text(serial, " WHEEL=-1 ", 5)
             restored = screenshot_region(monitor, temp_path / "wheel-down.ppm",
-                                         71, 117, 520, 272)
+                                         71 + 2 * cascade_step,
+                                        117 + 2 * cascade_step, 520, 272)
             if restored != before:
                 differing_rows = [
                     row for row in range(272)
@@ -310,9 +328,13 @@ def main():
             monitor.click(20, taskbar_y)
             monitor.click(40, settings_y)
             wait_for_text(serial,
-                'BOOK8-DESKTOP: WINDOW id=4 title="System Settings" registered',
+                'BOOK8-DESKTOP: WINDOW id=5 title="System Settings" registered',
                 5)
-            # Time and Date is the initial page; increment the hour and apply.
+            # Settings opens on Network & Internet. Page through Input, Apps,
+            # Display, Sounds and Storage to System (Date/Time), increment the
+            # hour, then apply.
+            for _ in range(6):
+                monitor.command("sendkey pgdn", 0.1)
             monitor.command("sendkey right")
             monitor.command("sendkey ret")
             wait_for_text(serial, "BOOK8-SETTINGS: time set ", 5)
@@ -322,11 +344,11 @@ def main():
             monitor.click(40, programs_y)
             monitor.click(200, taskmgr_y)
             wait_for_text(serial,
-                'BOOK8-DESKTOP: WINDOW id=5 title="Task Manager" registered',
+                'BOOK8-DESKTOP: WINDOW id=6 title="Task Manager" registered',
                 5)
             monitor.command("sendkey ctrl-alt-esc")
             wait_for_text(serial,
-                'BOOK8-DESKTOP: hotkey Task Manager id=5', 5)
+                'BOOK8-DESKTOP: hotkey Task Manager id=6', 5)
             monitor.command("sendkey right", 0.15)
             monitor.command("sendkey left", 0.15)
             # Row 0 is the desktop itself; the second Down selects File Explorer.
@@ -334,17 +356,17 @@ def main():
             monitor.command("sendkey down", 0.15)
             monitor.command("sendkey delete", 0.15)
             wait_for_text(serial,
-                'BOOK8-DESKTOP: WINDOW closed id=1 title="File Explorer"', 5)
+                'BOOK8-DESKTOP: WINDOW closed id=2 title="File Explorer"', 5)
             log = serial.read_text(errors="replace")
-            if 'id=6 title="Task Manager"' in log:
+            if 'id=7 title="Task Manager"' in log:
                 raise AssertionError("Task Manager opened a second instance")
             monitor.click(20, taskbar_y)
             monitor.click(40, height - 50)
             monitor.click(200, height - 50)
             wait_for_text(serial, "BOOK8GUI closed.")
             print("PASS: BOOK8 desktop test")
-            print(f"Serial markers: windows=5, taskbar={height - 36}..{height - 1}, "
-                  "clean boot, Start menu launches, focus routing, "
+            print(f"Serial markers: windows=5 after sign-in, taskbar={height - 36}..{height - 1}, "
+                  "sign-in autostart, Start menu launches, focus routing, "
                   "min/max/restore, Settings time set, "
                   "maximized viewport bounds, bidirectional USB wheel rendering, "
                   "Task Manager hotkey + End Task, "

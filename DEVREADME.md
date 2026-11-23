@@ -16,9 +16,13 @@ The current kernel already includes:
 - ATA IDE PIO storage discovery and read/write support
 - AHCI SATA discovery and sector I/O
 - FAT16/FAT32 filesystem mounting, read/write, and limited NTFS support
-- installer image creation and disk installation flow
+- installer image creation, per-ELF application selection and disk installation flow
+- unsigned build-time SHA-256 boot integrity manifest for GRUB-loaded payloads
 - USB UHCI keyboard/mouse support plus a polled OHCI boot-HID path
-- framebuffer multi-window desktop shell (`BOOK8GUI`) with Explorer and Command Shell apps
+- framebuffer multi-window desktop shell (`BOOK8GUI`) with Explorer, Command
+  Shell, settings, task manager and media apps; 512 registry program slots
+- media bookmarks in bounded `A:\MEDIA.BMK`, explicit network-stream
+  confirmation, and a fixed-point FFT visualization driven by live HDA PCM
 - shell command dispatch and built-in command set
 - RTL8168/RTL8111 polled TX/RX with a zero-allocation kernel ARP/IPv4/ICMP/UDP
   stack and non-blocking DHCP (DORA, renew/rebind/expiry), default dynamic IPv4,
@@ -33,10 +37,10 @@ The current kernel already includes:
 - UDP 8081 push agent disabled; local `RELAUNCH` remains available
 - NV register diagnostics are read-only and available in the NV Diagnostic GUI; boot automatically launches BOOK8GUI quietly
 - QEMU smoke tests covering BIOS/UEFI boot and installer behavior
-- a single-active-task Ring 3 ELF loader (`EXEC`) with versioned `.b8s` imports, plus kernel threads and experimental SMP (APs run kernel threads only)
+- a unified user-task model: concurrent Ring 3 ELF tasks with per-task page tables, per-CPU TSS privilege stacks, versioned `.b8s` imports, bounded kernel/user IPC and kernel threads, plus experimental SMP (user tasks remain BSP-owned)
 - a freestanding libc subset with host and in-kernel self-tests (`LIBTEST`)
 
-This is a kernel-first, single-address-space system. It is intentionally a lab OS and test environment rather than a polished production kernel.
+This is a kernel-first system with isolated per-task user address spaces layered over a shared kernel map. It is intentionally a lab OS and test environment rather than a polished production kernel.
 
 ## Project file review
 
@@ -52,17 +56,36 @@ The project is small but complete enough to understand as a single kernel build.
 - `linker.ld`: kernel linker script linking the boot object and the kernel objects into a single ELF.
 - `grub/grub.cfg`: GRUB menu entries for normal BOOK8 boot and the installer flow.
 - `.gitignore`: ignores build artifacts and temporary working files.
-- `tests/qemu_installer_smoke.py`: end-to-end QEMU validation script for shell, USB input, GUI, cancellation, install path, and cold boot checks.
-- `tests/qemu_desktop_test.py`: disposable-disk QEMU regression for desktop registration, taskbar focus, input routing, Explorer navigation, and USB mouse counters.
+- `tools/gen_boot_hashes.py`: generates and rechecks the fixed-layout Multiboot2
+  boot integrity manifest after the final kernel link.
+- `src/boot_hash.c` / `src/boot_hash.h`: kernel-side manifest parser and
+  `book8_sha256()` verification helpers for trusted payloads.
+- `tests/boot_hash_host_test.c`: sanitized host test for manifest parsing, path
+  key normalization, memory/file verification and corrupt/truncated manifests.
+- `tests/qemu_boot_hash_test.py`: QEMU regression that corrupts `HELLO.ELF` and
+  checks rejection before execution.
+- `tests/qemu_installer_smoke.py`: end-to-end QEMU validation script for shell, USB input, GUI, cancellation, install path, ELF selection and cold boot checks.
+- `tests/qemu_desktop_test.py`: disposable-disk QEMU regression for the current
+  autostart sign-in flow, taskbar focus, input routing, Explorer navigation,
+  window controls and USB mouse counters.
+- `tests/qemu_explorer_context_test.py`: disposable-image regression for the
+  Explorer context Open path and NoteEditor `.CFG` fallback.
 - `tests/qemu_ohci_mouse_test.py`: SB710-like QEMU profile regression for OHCI HID mouse enumeration and input; pass a disposable FAT data image so the kernel can load its trusted USB module.
-- `tests/book8gui_host_test.c`: headless desktop behavior test run during the build.
+- `tests/book8gui_host_test.c`: headless desktop behavior test run during the
+  build, including the Open With association and submenu matrix.
 
 ### Source tree
 
 - `src/boot.S`: Multiboot2 header, page-table setup, 32-bit to 64-bit transition, and handoff to `kernel_main()`.
-- `src/kernel.c`: the main kernel implementation: console, storage discovery, IDE/AHCI drivers, USB input, shell, GUI bridge, installer logic, and command dispatcher.
+- `src/boot_hash.c` / `src/boot_hash.h`: fixed-layout SHA-256 integrity manifest
+  loaded as Multiboot2 module `book8-hashes`; verified before trusted payloads
+  are executed. See the Boot integrity manifest section below.
+- `src/kernel.c`: together with the split `src/*.c` modules (`boot.c`,
+  `install.c`, `shell.c`, `storage.c`, `input.c`, `kernel_usb.c`, etc.), the main
+  kernel implementation: console, storage discovery, IDE/AHCI drivers, USB
+  input, shell, GUI bridge, installer logic, and command dispatcher.
 - `drivers/ata_dma.h` and `drivers/ata_dma.c`: PCI IDE bus-master DMA (READ/WRITE DMA and DMA EXT, LBA28/LBA48) with a 64 KiB-aligned bounce buffer shared with AHCI multi-sector transfers. `kernel.c` chunks block-layer requests (up to 128 sectors), retries once, then falls back to single-sector PIO. At boot each DMA/AHCI disk prints `STORAGE: <disk> ... selftest PASS|FAIL`, checked by `tests/qemu_storage_test.py`; `tests/ata_dma_host_test.c` unit-tests the register encoding. The same QEMU test also attaches IDE and AHCI scratch disks (sector 0 = `BOOK8SCRATCH`; the kernel's destructive write self-test runs only on such disks), checks DMA write/flush/read-back, injected bus-master/timeout/device faults (`ata_inject_fault`), and a 200-sector chunked write, then verifies the images from the host including guard sectors.
-- `drivers/hda.h`, `drivers/hda.c` and `drivers/hda_stream.c`: ATI SB7xx HDA at PCI `00:14.2`, using firmware BARs, bus-master enable and the SB7xx snoop bit at PCI config `0x42` while preserving `0x44`/`0x4c`. It initializes CORB/RIRB, discovers the VIA codec's widget connections, routes 48 kHz stereo S16 audio to rear green and front headphone pins, and retains the route amplifier controls. The desktop taskbar adds a classic gray vertical volume popup and mute control between network indicators and the clock. `BOOK8 Player` now has a VLC-style dark interface with a menu bar (Media, Playback, Audio, Video, Subtitle, Tools, View, Help), transport toolbar, seek bar, volume slider, playlist, bookmarks, Jump to Time, and a Tools/Preferences dialog. It reads local WAV files and supports PCM 48 kHz stereo 16-bit playback, pause/resume, seek, stop, repeat, and HDA volume/mute control. Browser audio media can use the same path for bounded HTTP WAV responses. Stream refill is polled on desktop frames; IRQ delivery remains masked because BOOK8 does not yet route this controller's IRQ. WAVs are capped at 2 MiB locally and browser responses at 512 KiB. MP3/other codecs, HTTPS/TLS, JavaScript, adaptive streaming, YouTube and video decoding are unsupported. Host tests cover codec routing/gain/mute, stream parsing/refills and GUI/browser controls; physical ATI/VIA audio has not been verified.
+- `drivers/hda.h`, `drivers/hda.c` and `drivers/hda_stream.c`: ATI SB7xx HDA at PCI `00:14.2`, using firmware BARs, bus-master enable and the SB7xx snoop bit at PCI config `0x42` while preserving `0x44`/`0x4c`. It initializes CORB/RIRB, discovers the VIA codec's widget connections, routes 48 kHz stereo S16 audio to rear green and front headphone pins, and retains the route amplifier controls. The desktop taskbar adds a classic gray vertical volume popup and mute control between network indicators and the clock. `BOOK8 Player` now has a VLC-style dark interface with a menu bar (Media, Playback, Audio, Video, Subtitle, Tools, View, Help), transport toolbar, seek bar, volume slider, playlist, bookmarks, Jump to Time, and a Tools/Preferences dialog. It reads local WAV files and supports PCM 48 kHz stereo 16-bit playback, pause/resume, seek, stop, repeat, and HDA volume/mute control. The HDA module exposes two 4096-byte playback DMA blocks; GUI code reads a bounded live PCM snapshot through `B8_HDA_IOCTL_GET_PCM_WINDOW` / `struct b8_hda_pcm_window` without changing the versioned `b8_hda_module_api` ABI. Browser audio media can use the same path for bounded HTTP WAV responses. Stream refill is polled on desktop frames; IRQ delivery remains masked because BOOK8 does not yet route this controller's IRQ. WAVs are capped at 2 MiB locally and browser responses at 512 KiB. MP3/other codecs, HTTPS/TLS, JavaScript, adaptive streaming, YouTube and video decoding are unsupported. Host tests cover codec routing/gain/mute, stream parsing/refills and GUI/browser controls; physical ATI/VIA audio has not been verified.
 - `drivers/pcie.h` and `drivers/pcie.c`: validated below-4-GiB MCFG/ECAM access,
   conventional segment-zero fallback, firmware topology enumeration and
   upstream-first PCI D0 preparation for GTX 970 `01:00.0`. PCI word writes
@@ -157,7 +180,7 @@ This means the kernel is acting as both:
 - the driver runtime
 - the filesystem service runtime
 
-There is no general protected multi-process userspace: kernel threads and a single-active-task Ring 3 ELF loader (`EXEC`) exist, but concurrent ELF processes and per-process address spaces do not.
+Protected multi-task userspace is provided by `EXEC`: Ring 3 ELF tasks each own a user page table, are scheduled by the BSP timer path, enter CPL0 through the active CPU's TSS `RSP0`, and exchange bounded messages through kernel IPC ports. It is not a POSIX process model: user tasks are BSP-owned, have no fork/signals, and share the kernel's device namespace.
 
 ### Console and driver layer
 
@@ -245,6 +268,7 @@ The installer flow is especially important:
 - it exposes disk inventory to the shell
 - the user chooses a target disk
 - installation requires confirmation of the selected disk and destructive partition replacement before writing
+- the installer lists packaged applications and accepts `A` (all, default), `N` (none), `S` (per-ELF `Y`/`N`) or `Q` (cancel before write); excluded ELFs are removed from installed `A:\BIN` and omitted from registry seeding
 - it copies the prepared FAT32 installer image in multi-sector batches, expands the root volume, then writes and verifies the root and raw-swap partition table
 - progress is printed during image copy and FAT32 relocation/initialization
 - registry writes are deferred until the installed FAT32 root is mounted as `A:`, where the installer seeds `BOOK8.CFG` and the initial registry state
@@ -265,7 +289,7 @@ Supported/relevant capabilities:
 
 Current limitations are explicit and deliberate:
 
-- no general POSIX userspace or concurrent multi-process isolation (`EXEC` loads one Ring 3 ELF at a time)
+- no POSIX process model (no `fork`, signals, credentials or POSIX namespaces); `EXEC` schedules multiple isolated Ring 3 ELF tasks but user execution remains BSP-owned
 - shell `MD`/`RD` are deferred; directory creation/removal is available through the filesystem API and GUI
 - no general-purpose NTFS write pipeline beyond the constrained root-file overwrite path
 - no production-grade safe behavior for blindly overwriting disk metadata
@@ -278,8 +302,8 @@ and can also be launched with `BOOK8GUI` from a command-shell boot. Explorer and
 Command Shell have separate render/event modules.
 
 This keeps GUI code close to the kernel rather than depending on a separate
-user-mode window manager; standalone Ring 3 utilities are loaded by `EXEC` but
-do not host the desktop.
+user-mode window manager; standalone Ring 3 utilities may run concurrently under
+`EXEC` but do not host the desktop.
 
 The desktop currently supports:
 
@@ -304,9 +328,10 @@ intercepts input before window routing. Only a successful backend mode switch
 starts confirmation; timeout/cancel/save failure restores the old actual mode
 and saved window geometry. Restoration failure stays modal for retry. The
 firmware framebuffer backend intentionally leaves `set_display_mode` NULL.
-The host `control_panel_host_test` exercises this contract, while
-`tests/qemu_control_panel_test.py` checks all pages and reboot persistence using
-a temporary copy of a regular data image.
+The host `control_panel_host_test` exercises this contract and the About dialog,
+while `tests/qemu_control_panel_test.py` checks all pages and reboot persistence
+using a temporary copy of a regular data image. `tests/qemu_about_test.py` opens
+Settings, sends F1 and verifies the About diagnostics under QEMU.
 
 Add/Remove Programs uses the coordinator's bounded ELF discovery index and
 the `launch_program` platform hook. Built-in shortcuts and reserved/system
@@ -466,6 +491,21 @@ dialect responses fail explicitly. There is no SMB1/SMB3 fallback, DNS resolver,
 share-name RPC discovery, DFS or remote rename/delete/mkdir.
 The share field is required and defaults to `public`.
 
+Network/security feature flags (Phase 6) are compile-time switches in `net/net.h`:
+`BOOK8_NET_IPV6` (0 by default, header layout only, no full stack),
+`BOOK8_NET_FIREWALL` (0 by default, runtime toggle via `book8_net_firewall_set`),
+`BOOK8_NET_DNS_CACHE` (1 by default, 8-entry in-memory cache with 60s TTL), and
+`BROOK8_TLS_EMPTY` (TLS stub: `brook8_tls_available()` always returns false;
+no handshake or certificate validation - callers must fail closed on HTTPS).
+The firewall tracks destinations of outgoing IPv4 as established peers and
+drops unsolicited incoming IPv4 from unknown sources while enabled; DHCP
+replies (UDP 67->68) are always exempt. `net_features_host_test` covers all
+four flags, including both disabled and enabled compile configurations.
+
+`NETSAVE` static IP persistence: once the 30-second DHCP fallback activates,
+a late DHCP ACK no longer replaces the saved IPv4/mask/gateway; the ACK's DNS
+and lease metadata are still recorded. This is verified in `dhcp_host_test`.
+
 The masked login modal offers username/domain/password, explicit Guest and an
 optional transient login. Authentication errors reopen it for retry, while
 share/file permission and connection errors use explanatory alerts, not raw
@@ -503,12 +543,14 @@ hardware network validation.
 ### BOOK8 Player
 
 BOOK8 Player is the desktop's VLC-style sound player. Its Media menu opens a
-local WAV file, an HTTP WAV/network stream (handed to Web Browser), or a folder
-as a generated playlist; Playback offers previous/next, Jump to Specific Time,
-bookmarks and playback-speed markers; Audio exposes stereo/mono status, mute,
-visualization and maximum volume; Tools opens Preferences, Codec Information
-and Reset Preferences. The dark canvas shows an orange cone glyph, track-status
-text and an optional spectrum-style visualization while playing.
+local WAV file, an HTTP WAV/network stream, or a folder as a generated playlist;
+**Open Network Stream...** now shows an explicit Open/Cancel confirmation before
+handing the stream to Web Browser (Enter/Y accepts, Esc/N cancels). Playback
+offers previous/next, Jump to Specific Time, bookmarks and playback-speed
+markers; Audio exposes stereo/mono status, mute, visualization and maximum
+volume; Tools opens Preferences, Codec Information and Reset Preferences. The
+dark canvas shows an orange cone glyph, track-status text and an optional
+spectrum-style visualization while playing.
 
 Preferences are persisted in `A:\MEDIA.CFG` and shared with Web Browser. The
 dialog has Interface (status bar/startup playlist/dark canvas), Audio (maximum
@@ -522,6 +564,73 @@ mono mixing, video tracks, subtitles and fullscreen are informational only
 because the audio path plays at the WAV's source rate and no video decoder is
 present. Only PCM 48 kHz stereo 16-bit WAV is accepted; MP3/other codecs,
 HTTPS/TLS, adaptive streaming, YouTube and video decoding remain unsupported.
+
+Bookmarks persist in `A:\MEDIA.BMK`, keyed by media path and bounded to 8 media
+x 8 bookmarks (160-byte paths, 24-byte labels). They live in a separate file so
+`A:\MEDIA.CFG` stays frozen at 28 bytes and its saved flag-bit offsets remain
+valid. `tests/book8_apps_host_test.c` saves, reloads and renders a bookmark.
+
+The visualization is no longer tick-driven bars. It is a 32-point radix-2 Q15
+FFT of a 128-byte window from the live HDA PCM snapshot; magnitudes are scaled
+with integer arithmetic only. GUI code obtains the snapshot through
+`B8_HDA_IOCTL_GET_PCM_WINDOW` / `struct b8_hda_pcm_window`, so no `double`,
+`libm` or SSE dependency is introduced and the versioned HDA module API is
+unchanged. When PCM is unavailable the bars fall back to zero.
+
+### Boot Splash
+
+Normal boots load `assets/book8-splash.b8s` as the Multiboot2 module
+`book8-splash`. This is a pre-rendered 512x286 RGBA image with a 16-byte
+`B8SPLASH` header; the kernel validates the header and blits the pixels
+centered on the framebuffer for a 3-second hold. No Python script, image
+decoder or external tool runs during boot. `book8.splash=N` selects 1-16 holds;
+`0` disables playback. The CLI and NV-diagnostic GRUB configs use
+`book8.splash=0` to keep marker-driven QEMU tests fast, while the standard GRUB
+config uses the default. Serial output confirms playback with
+`BOOK8-SPLASH: playing` and `BOOK8-SPLASH: complete`.
+
+### Boot integrity manifest
+
+`tools/gen_boot_hashes.py` runs after the final `book8.elf` link and creates
+`build/book8-hashes.bin`, which GRUB loads as Multiboot2 module `book8-hashes`.
+The format is deliberately small and fixed: magic `0x31483842` (`B8H1`
+little-endian), version 1, a 16-byte header, then 64-byte entries of a 32-byte
+ASCII key and a 32-byte SHA-256 digest; at most 128 entries are accepted. The
+current build has 13 entries (848 bytes): `SPLASH`, three aliases for the final
+kernel (`KERNEL`, `BOOK8.ELF`, `BOOT/BOOK8.ELF`), six `installer/apps.manifest`
+payloads and the three root ELFs.
+
+`src/boot_hash.c` validates the manifest and uses the existing `book8_sha256()`
+implementation to verify memory and file payloads before execution. Path keys
+are normalized to upper case with `/` separators, and verification failures log
+`BOOK8-HASH: verification failed for <KEY>`. This is build integrity, not secure
+boot: the manifest is unsigned and a cold GRUB-loaded kernel cannot hash its own
+running image, so the build binds the manifest to the exact linked kernel and
+rechecks it with `--check`. `tests/boot_hash_host_test.c` covers parsing,
+normalization, memory/file verification and corrupt/truncated manifests;
+`tests/qemu_boot_hash_test.py` corrupts `HELLO.ELF` and confirms boot-time
+rejection.
+
+### About BOOK8
+
+System Settings has an `About` button in its header, and F1 opens the same
+dialog from any Settings category without changing the frozen eight-category
+layout. The dialog shows `BOOK8_GUI_VERSION` and six local documentation links:
+`README`, `DEVREADME`, `KERNEL_NOTES`, `CHECKPOINT`, `OPENCODE_MAP` and
+`INSTALLER`. Selecting a link and pressing Enter (or clicking `Open`) launches
+Code Editor on the matching `A:\DOC\*` file. `build.sh` packages those files in
+both data images and the boot application image; the installer packages them in
+`DOC\` as well. Code Editor's buffer is 128 KiB so the full README and kernel
+notes fit. Serial diagnostics use `BOOK8-ABOUT: opened`, `BOOK8-ABOUT: open
+<path>` and `BOOK8-ABOUT: closed`. `tests/qemu_about_test.py` authenticates a
+desktop, opens Settings with F1, checks both dialog states and confirms the
+selected document launches Code Editor on `A:\DOC\README.MD`.
+
+The larger editor buffer moves `__kernel_end` to about 70.5 MiB, so the NETBOOT
+and relaunch staging window now starts at `0x05000000` (80 MiB) instead of
+`0x04400000`. The 8 MiB window still ends at 88 MiB and is verified against the
+firmware memory map before any write; warm-jump assembly and relaunch host tests
+use the same address.
 
 ### PaintBook and Web Browser
 
@@ -555,8 +664,10 @@ not supported. Google responds over HTTP with a chunked page, but may require
 JavaScript to display search results; the browser can show its static response
 text, not the interactive results. Network requests use the existing single
 outgoing TCP context.
-The host build also runs `book8_image_host_test` for BMP decoding and
-dimension/input bounds and decoder-pool isolation, and `book8_apps_host_test`
+The host build also runs `boot_splash_host_test` for the shipped pre-rendered
+splash asset and `book8_image_host_test` for BMP decoding, dimension/input
+bounds and decoder-pool isolation, and
+`book8_apps_host_test`
 for PaintBook drawing/BMP export, player menus/dialogs, WAV/volume/seek controls,
 network-stream handoff, preferences persistence, browser homepage/cookie
 controls, entity/title parsing, relative inline-link clicks, HTTP redirects,
@@ -679,7 +790,7 @@ This progression is the correct foundation for building more "applications" on t
 
 The project is already structured around a single kernel runtime. That is the safest way to extend the OS without prematurely designing a full userspace ABI.
 
-For future app work, do not assume a full POSIX process model exists. Apps can be kernel-linked modules or standalone freestanding ELF64 executables loaded by `EXEC` into the single active Ring 3 slot; there is no concurrent multi-process isolation or protected per-process address space.
+For future app work, do not assume a full POSIX process model exists. Apps can be kernel-linked modules or freestanding ELF64 executables loaded by `EXEC` as isolated Ring 3 tasks with their own user page tables; scheduling of those tasks is currently BSP-owned and IPC is bounded-message based.
 
 ### 2. Use the shell as the app launcher
 
@@ -746,7 +857,7 @@ The BOOK8 kernel is currently designed around this flow:
 For future apps, maintain this model:
 
 - the kernel remains the execution environment and service provider
-- app entry points are kernel-linked functions/modules or freestanding ELF64 executables loaded by `EXEC` into the single Ring 3 slot
+- app entry points are kernel-linked functions/modules or freestanding ELF64 executables loaded by `EXEC` into isolated Ring 3 tasks
 - command dispatch launches both forms from the same shell
 - the shell remains the top-level orchestration layer
 
@@ -794,14 +905,93 @@ As more apps are developed, enforce these rules:
 
 This is especially important because the project currently contains disk-erasing utilities and physically destructive operations.
 
+### Phase 1 immediate stabilization
+
+Four frozen contracts keep UI and persisted settings from drifting:
+
+- **UI geometry.** `tests/ui_geometry.py` is the single source of truth for
+  taskbar height, menu row pitch, panel chrome and click targets. Every QEMU
+  test that opens the Programs submenu derives coordinates from it (row
+  *identity* still comes from the dynamic `PROGRAM-MENU-ROW` lookup). The same
+  numbers are pinned by `_Static_assert` in `src/book8gui.c`, so a GUI layout
+  change fails the build until the test module is updated in lockstep.
+- **Media preference bits.** `src/apps/book8_media_extension.h` defines each
+  `interface_flags`, `plugins` and `web` flag as `1u << N` with a documented
+  bit map and explicitly reserved bits. Exact hex values are asserted at
+  compile time in `book8_media_extension.c`, and
+  `tests/book8_apps_host_test.c` verifies the flags land at the right byte
+  offsets in the serialized `A:\MEDIA.CFG` image. Existing saved settings keep
+  their meaning.
+- **Settings categories.** `SETTINGS_CATEGORY_COUNT` is asserted to be `8u` in
+  `src/apps/book8_settings.c`; adding a category now requires an explicit
+  migration instead of silently renumbering registry indices.
+- **Program capacity.** `BOOK8_MAX_PROGRAMS` is `512u` and
+  `BOOK8GUI_MAX_PROGRAMS` aliases it; `_Static_assert` in `src/book8gui.c`
+  rejects any future split. Bookmarks use a separate `A:\MEDIA.BMK` file so the
+  28-byte `A:\MEDIA.CFG` layout is not expanded.
+
+### Phase 8 QA and testing infrastructure
+
+The build-invoked GUI tests no longer encode menu row numbers. After every
+program rescan, `src/book8gui.c` emits one serial line per visible Programs row:
+
+```
+PROGRAM-MENU-ROW: <row>|<display name>|<executable path>
+```
+
+`tests/qemu_ui_lookup.py` parses the most recent contiguous block of those
+lines and resolves an entry by display name or installed ELF path, computing
+the click Y from the live framebuffer height. `qemu_utilities_test.py`,
+`qemu_netshare_test.py`, `qemu_static_programs_test.py`,
+`qemu_explorer_context_test.py` and `qemu_desktop_test.py` use it, so adding or
+removing an ELF cannot shift a row out from under a test. The autostart sign-in
+modal consumes cascade slot 0, so in-window click targets in the desktop and
+Explorer context tests include the matching 24 px step. Manual-only scripts in
+`tests/` may still contain other fixed in-window coordinates.
+
+Additional automated gates complement the host suite:
+
+- `bash ./tests/build_matrix.sh` compiles and runs `net_features_host_test`
+  across six `BOOK8_NET_IPV6` / `BOOK8_NET_FIREWALL` /
+  `BOOK8_NET_DNS_CACHE` / `BROOK8_TLS_EMPTY` combinations, and also performs a
+  freestanding compile of `net/net.c` for each combination.
+- `tests/syscall_fuzz_host_test.c` is an AFL-light mutation fuzzer: it mutates
+  a deterministic seed corpus (`tests/fuzz/frames.seed` plus built-in frames),
+  feeds each `struct syscall_frame` to the real `syscall_dispatch()`, and
+  replays the same run to prove determinism. It is compiled with ASan/UBSan
+  and run by `build.sh` (5,000 cases by default). `SYS_exit` is skipped because
+  it would halt the host process; QEMU covers that path.
+- `tests/user_ipc_host_test.c` drives the real dispatcher through IPC port
+  ownership, queue saturation, bounded user copies, both kernel/user IPC
+  directions, TSS stack publication and the spawn/yield ABI with ASan/UBSan.
+- `tests/boot_hash_host_test.c` and `tests/qemu_boot_hash_test.py` verify the
+  generated manifest and that a corrupted packaged ELF is rejected at boot.
+- `tests/book8gui_host_test.c` now covers the Open With association matrix and
+  every right-click submenu handler (editor, player, code editor, hex viewer,
+  PaintBook) plus the no-association fallback.
+- `tests/qemu_installer_smoke.py --install-only` covers per-ELF deselection and
+  cold-boot indexing in addition to the existing install/cancel flow.
+
+`.github/workflows/build.yml` runs these gates on every pull request and push
+to `main`/`master`. The build job uses `BOOK8_SKIP_RING3_SMOKE=1` (all host
+tests, no long QEMU suite) and uploads the produced ISOs; the matrix job runs
+`tests/build_matrix.sh`. `build-installer-image.sh` needs loop devices, so the
+build job invokes `build.sh` with `sudo`.
+
+ABI layouts are frozen by `_Static_assert` in `src/syscall.c` for the syscall
+frame, framebuffer info and GUI utility request structs. An accidental layout
+change now fails the build instead of booting with a broken ABI.
+
 ### Validation approach for future work
 
 Keep the current test discipline:
 
 - rebuild with the project scripts
 - run `tests/book8gui_host_test.c` for the desktop's headless preflight
-- run `python3 tests/qemu_desktop_test.py build/book8.iso /tmp/d.img` for desktop interaction changes
+- run `python3 tests/qemu_desktop_test.py build/book8.iso /tmp/d.img` for desktop interaction changes; it now authenticates the current autostart sign-in modal and uses OHCI for the virtual mouse
+- run `python3 tests/qemu_explorer_context_test.py build/book8-cli.iso build/book8-data16.img` for Explorer context-menu or file-association changes
 - run `python3 tests/qemu_ohci_mouse_test.py build/book8.iso` for OHCI input changes
+- run `python3 tests/qemu_installer_smoke.py build/book8-cli.iso --install-only` for installer selection/deselection changes
 - run the QEMU smoke tests for installer and input flows
 - smoke-test shell commands for each new app entry
 - validate keyboard and mouse behaviors in the GUI or shell

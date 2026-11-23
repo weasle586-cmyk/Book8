@@ -15,6 +15,139 @@ _Static_assert(UDP_SIZE == 8u, "UDP header size");
 
 static const uint8_t broadcast_mac[6] = {255u, 255u, 255u, 255u, 255u, 255u};
 
+/* ------------------------------------------------------------
+ * IPv6 support stub (Phase 6). BOOK8_NET_IPV6 is 0 by default;
+ * only the query function is compiled. The header layout lives
+ * in net.h for a future full-stack port.
+ * ------------------------------------------------------------ */
+#if BOOK8_NET_IPV6
+bool book8_net_ipv6_supported(void) { return true; }
+#else
+bool book8_net_ipv6_supported(void) { return false; }
+#endif
+
+/* ------------------------------------------------------------
+ * TLS placeholder (Phase 6). No handshake is performed and no
+ * certificate validation occurs. Callers must fail closed on HTTPS.
+ * ------------------------------------------------------------ */
+bool brook8_tls_available(void) { return false; }
+
+/* ------------------------------------------------------------
+ * In-memory DNS cache (Phase 6). Bounded, no persistence.
+ * ------------------------------------------------------------ */
+#if BOOK8_NET_DNS_CACHE
+static struct book8_dns_cache_entry dns_cache[BOOK8_NET_DNS_CACHE_ENTRIES];
+static uint8_t dns_cache_next;
+
+static bool dns_name_equal(const char *a, const char *b)
+{
+    for (size_t i = 0u; i < BOOK8_NET_DNS_CACHE_NAME_MAX; ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + ('a' - 'A'));
+        if (ca != cb) return false;
+        if (ca == '\0') return true;
+    }
+    return true;
+}
+
+bool book8_dns_cache_lookup(const char *name, uint64_t now_ms, uint32_t *ip)
+{
+    if (name == NULL || ip == NULL) return false;
+    for (size_t i = 0u; i < BOOK8_NET_DNS_CACHE_ENTRIES; ++i) {
+        struct book8_dns_cache_entry *e = &dns_cache[i];
+        if (e->name[0] != '\0' && now_ms < e->expires_ms
+            && dns_name_equal(e->name, name)) {
+            *ip = e->ip;
+            return true;
+        }
+    }
+    return false;
+}
+
+void book8_dns_cache_insert(const char *name, uint32_t ip, uint64_t now_ms)
+{
+    if (name == NULL || name[0] == '\0' || ip == 0u) return;
+    for (size_t i = 0u; i < BOOK8_NET_DNS_CACHE_ENTRIES; ++i) {
+        struct book8_dns_cache_entry *e = &dns_cache[i];
+        if (e->name[0] != '\0' && dns_name_equal(e->name, name)) {
+            e->ip = ip;
+            e->expires_ms = now_ms + BOOK8_NET_DNS_CACHE_TTL_MS;
+            return;
+        }
+    }
+    struct book8_dns_cache_entry *slot = &dns_cache[dns_cache_next];
+    size_t len = strlen(name);
+    if (len >= sizeof(slot->name)) len = sizeof(slot->name) - 1u;
+    /* Byte loop avoids fortify runtime (__memcpy_chk) in freestanding builds. */
+    for (size_t i = 0u; i < len; ++i) slot->name[i] = name[i];
+    slot->name[len] = '\0';
+    slot->ip = ip;
+    slot->expires_ms = now_ms + BOOK8_NET_DNS_CACHE_TTL_MS;
+    dns_cache_next = (uint8_t)((dns_cache_next + 1u) % BOOK8_NET_DNS_CACHE_ENTRIES);
+}
+
+void book8_dns_cache_flush(void)
+{
+    memset(dns_cache, 0, sizeof(dns_cache));
+    dns_cache_next = 0u;
+}
+
+uint32_t book8_dns_cache_entries(void)
+{
+    uint32_t count = 0u;
+    for (size_t i = 0u; i < BOOK8_NET_DNS_CACHE_ENTRIES; ++i) {
+        if (dns_cache[i].name[0] != '\0') ++count;
+    }
+    return count;
+}
+#endif /* BOOK8_NET_DNS_CACHE */
+
+/* ------------------------------------------------------------
+ * Firewall established-peer tracking (Phase 6).
+ * ------------------------------------------------------------ */
+#if BOOK8_NET_FIREWALL
+static void fw_remember(struct book8_net *n, uint32_t ip)
+{
+    if (ip == 0u) return;
+    for (size_t i = 0u; i < 8u; ++i) {
+        if (n->fw_peers[i] == ip) return;
+    }
+    n->fw_peers[n->fw_next] = ip;
+    n->fw_next = (uint8_t)((n->fw_next + 1u) % 8u);
+}
+
+static bool fw_established(const struct book8_net *n, uint32_t ip)
+{
+    for (size_t i = 0u; i < 8u; ++i) {
+        if (n->fw_peers[i] == ip) return true;
+    }
+    return false;
+}
+
+void book8_net_firewall_set(struct book8_net *n, bool enabled)
+{
+    if (n != NULL) n->firewall_enabled = enabled;
+}
+
+bool book8_net_firewall_enabled(const struct book8_net *n)
+{
+    return n != NULL && n->firewall_enabled;
+}
+
+uint32_t book8_net_firewall_dropped(const struct book8_net *n)
+{
+    return n != NULL ? n->fw_dropped : 0u;
+}
+
+void book8_net_firewall_peers_clear(struct book8_net *n)
+{
+    if (n == NULL) return;
+    memset(n->fw_peers, 0, sizeof(n->fw_peers));
+    n->fw_next = 0u;
+}
+#endif /* BOOK8_NET_FIREWALL */
+
 static bool same_mac(const uint8_t a[6], const uint8_t b[6])
 {
     return memcmp(a, b, 6u) == 0;
@@ -280,6 +413,13 @@ static enum book8_net_result ipv4_input(struct book8_net *n,
         || !same_mac(eth->destination, n->mac))) {
         return BOOK8_NET_IGNORED;
     }
+#if BOOK8_NET_FIREWALL
+    /* Drop unsolicited IPv4 from unknown peers; DHCP replies are exempt. */
+    if (n->firewall_enabled && !dhcp && !fw_established(n, source)) {
+        ++n->fw_dropped;
+        return BOOK8_NET_IGNORED;
+    }
+#endif
     /* Options are unsupported (including source routing); never echo them. */
     if (ihl != IP_SIZE) {
         return BOOK8_NET_IGNORED;
@@ -469,6 +609,9 @@ enum book8_net_result book8_net_send_ipv4(struct book8_net *n, uint32_t destinat
     const uint8_t *mac = NULL;
     enum book8_net_result result = route(n, destination, &mac);
     if (result != BOOK8_NET_OK) { return result; }
+#if BOOK8_NET_FIREWALL
+    fw_remember(n, destination);
+#endif
     ipv4_output(n, mac, destination, protocol, length);
     memcpy(n->tx + ETH_SIZE + IP_SIZE, payload, length);
     return emit(n, ETH_SIZE + IP_SIZE + length);
@@ -495,6 +638,9 @@ enum book8_net_result book8_udp_send(struct book8_net *n, uint16_t local_port,
     const uint8_t *mac = NULL;
     enum book8_net_result result = route(n, destination, &mac);
     if (result != BOOK8_NET_OK) { return result; }
+#if BOOK8_NET_FIREWALL
+    fw_remember(n, destination);
+#endif
     ipv4_output(n, mac, destination, 17u, UDP_SIZE + length);
     uint8_t *data = n->tx + ETH_SIZE + IP_SIZE;
     struct book8_udp_header udp = {

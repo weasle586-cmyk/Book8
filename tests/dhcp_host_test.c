@@ -150,8 +150,11 @@ static void test_static_timeout_fallback(void)
     assert(book8_net_input(&net, frame, size) == BOOK8_NET_OK);
     assert(net.ip == address); /* ACK applies outside RX. */
     assert(book8_dhcp_poll(&dhcp, 32001u) == BOOK8_NET_OK);
-    assert(dhcp.state == BOOK8_DHCP_BOUND && !dhcp.fallback_active);
-    assert(net.ip == assigned && net.mask == mask && net.gateway == gateway);
+    /* NETSAVE persistence: late ACK records lease metadata but keeps the
+       saved static IPv4 configuration active. */
+    assert(dhcp.state == BOOK8_DHCP_BOUND && dhcp.fallback_active);
+    assert(net.ip == address && net.mask == 0xffffff00u && net.gateway == server);
+    assert(dhcp.dns != 0u); /* DNS from ACK is still recorded. */
     assert(dhcp.generation == 2u);
     reset();
     assert(book8_dhcp_set_fallback(&dhcp, address, 0xffffff00u, server) == BOOK8_NET_OK);

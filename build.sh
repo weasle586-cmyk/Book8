@@ -28,6 +28,7 @@ else
     iso_name="book8.iso"
 fi
 iso_root="$build/iso"
+rm -rf "$iso_root"
 mkdir -p "$iso_root/boot/grub"
 python3 "$root/tools/gen_app_manifest.py" \
     --manifest "$root/installer/apps.manifest" \
@@ -116,12 +117,25 @@ printf 'BOOK8 network mode=DHCP, 30s timeout fallback: IP=%s MASK=%s GATEWAY=%s 
 
 gcc -m64 -c -ffreestanding -fno-pic -fno-pie -mno-red-zone \
     -o "$build/boot.o" "$root/src/boot.S"
-gcc -m64 -std=gnu11 -O2 -Wall -Wextra -Werror -ffreestanding \
-    -fno-stack-protector -fno-pic -fno-pie -fno-builtin \
-    -fno-asynchronous-unwind-tables -fno-unwind-tables \
-    -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
-    -mcmodel=small $BOOK8_DIAG_CFLAGS "${net_cflags[@]}" \
-    -I"$root/lib" -I"$build/generated" -c -o "$build/kernel.o" "$root/src/kernel.c"
+# The kernel is split into subsystem translation units that share src/kernel_internal.h.
+# Keep their ABI flags identical: the image is linked with ld -nostdlib, not a hosted CRT.
+kernel_sources=(
+    src/kernel.c src/kernel_state.c src/boot.c src/boot_hash.c src/acpi.c src/smp.c
+    src/interrupts.c src/console.c src/pci.c src/devices.c src/kernel_usb.c
+    src/kernel_net.c src/telemetry.c src/kernel_push.c src/storage.c
+    src/input.c src/diag.c src/shell.c src/install.c src/gui.c
+)
+kernel_objects=()
+for source in "${kernel_sources[@]}"; do
+    object="$build/k_$(basename "${source%.c}").o"
+    gcc -m64 -std=gnu11 -O2 -Wall -Wextra -Werror -ffreestanding \
+        -fno-stack-protector -fno-pic -fno-pie -fno-builtin \
+        -fno-asynchronous-unwind-tables -fno-unwind-tables \
+        -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+        -mcmodel=small $BOOK8_DIAG_CFLAGS "${net_cflags[@]}" \
+        -I"$root/lib" -I"$build/generated" -c -o "$object" "$root/$source"
+    kernel_objects+=("$object")
+done
 gcc -m64 -std=gnu11 -O2 -Wall -Wextra -Werror -ffreestanding \
     -fno-stack-protector -fno-pic -fno-pie -fno-builtin \
     -fno-asynchronous-unwind-tables -fno-unwind-tables \
@@ -331,6 +345,26 @@ gcc -std=gnu11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
     -o "$build/dhcp_host_test" "$root/tests/dhcp_host_test.c" \
     "$root/net/dhcp.c" "$root/net/network_settings.c" "$root/net/net.c"
 run_test "$build/dhcp_host_test"
+# Phase 6 network/security feature flags, in-memory DNS cache, stub ABI.
+gcc -std=gnu11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -o "$build/net_features_host_test" "$root/tests/net_features_host_test.c" \
+    "$root/net/net.c"
+run_test "$build/net_features_host_test"
+# Phase 8 QA: AFL-light mutation fuzzing of the real syscall dispatcher.
+# The harness stubs kernel dependencies, so sanitizers see every boundary copy.
+gcc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOOK8_HOST_TEST \
+    -ffunction-sections -fdata-sections \
+    -fsanitize=address,undefined -Wl,--gc-sections \
+    -o "$build/syscall_fuzz_host_test" "$root/tests/syscall_fuzz_host_test.c" \
+    "$root/src/syscall.c"
+run_test "$build/syscall_fuzz_host_test" 5000 0x424f4f4b383841 "$root/tests/fuzz"
+# User-mode task/IPC ABI coverage against the real dispatcher.
+gcc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOOK8_HOST_TEST \
+    -ffunction-sections -fdata-sections \
+    -fsanitize=address,undefined -Wl,--gc-sections \
+    -o "$build/user_ipc_host_test" "$root/tests/user_ipc_host_test.c" \
+    "$root/src/syscall.c"
+run_test "$build/user_ipc_host_test"
 gcc -std=gnu11 -O2 -Wall -Wextra -Werror -DBOOK8_HOST_TEST \
     -ffunction-sections -fdata-sections \
     -fsanitize=address,undefined -Wl,--gc-sections \
@@ -453,6 +487,9 @@ gcc -std=gnu11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
     "$root/src/apps/book8_image.c"
 run_test "$build/book8_image_host_test"
 gcc -std=gnu11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -o "$build/boot_splash_host_test" "$root/tests/boot_splash_host_test.c"
+run_test "$build/boot_splash_host_test" "$root/assets/book8-splash.b8s"
+gcc -std=gnu11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
     -o "$build/book8_apps_host_test" "$root/tests/book8_apps_host_test.c" \
     "$root/src/apps/book8_paintbook.c" "$root/src/apps/book8_image.c" \
     "$root/src/apps/book8_browser.c" "$root/src/apps/book8_media_extension.c" \
@@ -529,6 +566,7 @@ make_data_image() { # <image> <size MiB> <FAT bits>
     mmd -i "$1" ::/DRIVERS
     mmd -i "$1" ::/APPS
     mmd -i "$1" ::/APPS/EXECROLLBACK
+    mmd -i "$1" ::/DOC
     while IFS='|' read -r source target app_key display_name app_class hidden system_component; do
         [ -n "$source" ] || continue
         case "$source" in \#*) continue ;; esac
@@ -543,6 +581,12 @@ make_data_image() { # <image> <size MiB> <FAT bits>
     mcopy -i "$1" "$build/user/nvmap.elf" ::/NVMAP.ELF
     mcopy -i "$1" "$root/user/nvmap.cfg" ::/NVMAP.CFG
     mcopy -i "$1" "$build/user/msg.txt" ::/DATA/MSG.TXT
+    mcopy -i "$1" "$root/README.md" ::/DOC/README.MD
+    mcopy -i "$1" "$root/DEVREADME.md" ::/DOC/DEVREAD.MD
+    mcopy -i "$1" "$root/KERNEL_NOTES.md" ::/DOC/KERNELNO.MD
+    mcopy -i "$1" "$root/CHECKPOINT.md" ::/DOC/CHECKPT.MD
+    mcopy -i "$1" "$root/OPENCODE_MAP.txt" ::/DOC/OPENCODE.MAP
+    mcopy -i "$1" "$root/INSTALLER.txt" ::/DOC/INSTALL.TXT
     mcopy -i "$1" "$build/user/hello.elf" ::/APPS/EXECROLLBACK/APP.ELF
     printf '[Package]\nname=ExecRollback\nversion=1.0.0\nentry=app.elf\n[Dependencies]\nlibs=missing.b8s\n' \
         > "$build/exec-rollback-manifest.ini"
@@ -560,7 +604,8 @@ gcc -std=gnu11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
     -o "$build/boot_update_host_test" "$root/tests/boot_update_host_test.c" \
     "$root/src/filesystem.c" "$root/fs/fs.c" "$root/drivers/block.c"
 ld -m elf_x86_64 -T "$root/linker.ld" -nostdlib -o "$build/book8.elf" \
-    "$build/boot.o" "$build/kernel.o" "$build/filesystem.o" "$build/registry.o" "$build/session.o" "$build/boot_log.o" "$build/system_config.o" \
+    "$build/boot.o" "${kernel_objects[@]}" \
+    "$build/filesystem.o" "$build/registry.o" "$build/session.o" "$build/boot_log.o" "$build/system_config.o" \
     "$build/syscall.o" "$build/syscall_entry.o" "$build/ap_trampoline.o" \
     "$build/user_smoke.o" \
     "$build/interrupt_entry.o" "$build/book8gui.o" \
@@ -603,6 +648,19 @@ for symbol in book8_pcie_enumerate book8_pcie_bind_drivers \
     fi
 done
 printf 'PASS: linked kernel contains PCIe initialization and exception-safe MSR/#GP handler\n'
+
+# Generate the boot integrity manifest only after the final kernel link, then
+# verify both the generator output and the kernel-side parser against it.
+python3 "$root/tools/gen_boot_hashes.py" \
+    --root "$root" --kernel "$build/book8.elf" \
+    --output "$build/book8-hashes.bin"
+python3 "$root/tools/gen_boot_hashes.py" \
+    --root "$root" --kernel "$build/book8.elf" \
+    --output "$build/book8-hashes.bin" --check
+gcc -std=gnu11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -o "$build/boot_hash_host_test" "$root/tests/boot_hash_host_test.c" \
+    "$root/src/boot_hash.c" "$root/net/sha256.c"
+run_test "$build/boot_hash_host_test" "$build/book8-hashes.bin" "$build/book8.elf"
 
 verify_boot_kernel() (
     local image="$1" format="$2"
@@ -661,7 +719,34 @@ for driver in nv_maxwell rtl8168 usbhost ac97; do
     rm -f "$verify"
 done
 printf 'PASS: all trusted driver modules packaged and verified in internal boot volume\n'
+verify_docs() {
+    local image="$1" source target size
+    local verify="$build/.verify-doc"
+    while IFS='|' read -r source target; do
+        [ -n "$source" ] || continue
+        size="$(wc -c < "$root/$source")"
+        if [ "$size" -ge 131071 ]; then
+            printf 'Documentation file exceeds the Code Editor buffer: %s\n' "$source" >&2
+            exit 1
+        fi
+        mcopy -i "$image" "::/DOC/$target" "$verify"
+        cmp "$root/$source" "$verify"
+        rm -f "$verify"
+    done <<'DOCS'
+README.md|README.MD
+DEVREADME.md|DEVREAD.MD
+KERNEL_NOTES.md|KERNELNO.MD
+CHECKPOINT.md|CHECKPT.MD
+OPENCODE_MAP.txt|OPENCODE.MAP
+INSTALLER.txt|INSTALL.TXT
+DOCS
+}
+verify_docs "$build/book8-data16.img"
+verify_docs "$build/book8-data32.img"
+printf 'PASS: BOOK8 documentation packaged for About links in both data images\n'
 cp "$build/book8-install.img" "$iso_root/boot/book8-install.img"
+cp "$root/assets/book8-splash.b8s" "$iso_root/boot/book8-splash.b8s"
+cp "$build/book8-hashes.bin" "$iso_root/boot/book8-hashes.bin"
 cp "$root/grub/grub.cfg" "$iso_root/boot/grub/grub.cfg"
 if [ "${BOOK8_DIAGNOSTIC:-0}" = 1 ]; then
     cp "$root/grub/grub-nv-diagnostic.cfg" "$iso_root/boot/grub/grub.cfg"
@@ -691,6 +776,8 @@ if [ "${BOOK8_BUILD_ONLY:-0}" != 1 ] \
             python3 "$root/tests/qemu_boot_log_test.py" "$build/$iso_name" "$build/book8-data16.img"
         else
             python3 "$root/tests/qemu_static_programs_test.py" "$build/$iso_name" "$build/book8-data16.img"
+            python3 "$root/tests/qemu_splash_test.py" "$build/$iso_name" "$build/book8-data16.img"
+            python3 "$root/tests/qemu_about_test.py" "$cli_iso" "$build/book8-data16.img"
             python3 "$root/tests/qemu_installer_smoke.py" "$cli_iso" --installer-boot-only
             python3 "$root/tests/qemu_utilities_test.py" "$cli_iso" "$build/book8-data16.img"
             python3 "$root/tests/qemu_netshare_test.py" "$cli_iso" "$build/book8-data16.img"
@@ -700,6 +787,7 @@ if [ "${BOOK8_BUILD_ONLY:-0}" != 1 ] \
             python3 "$root/tests/qemu_netboot_jump_test.py"
             python3 "$root/tests/qemu_exec_test.py" "$build/$iso_name" "$build/book8-data16.img"
             python3 "$root/tests/qemu_exec_test.py" "$build/$iso_name" "$build/book8-data32.img"
+            python3 "$root/tests/qemu_boot_hash_test.py" "$cli_iso" "$build/book8-data16.img"
             python3 "$root/tests/qemu_nvmap_startup_test.py" "$cli_iso" "$build/book8-data16.img"
             python3 "$root/tests/qemu_relaunch_test.py" "$cli_iso" "$build/book8-data16.img" "$build/book8.elf"
             python3 "$root/tests/qemu_drives_test.py" "$cli_iso" "$build/book8-data16.img" "$build/book8-data32.img"

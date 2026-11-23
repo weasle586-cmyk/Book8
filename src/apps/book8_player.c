@@ -10,10 +10,12 @@
 #define PLAYER_PATH_CAPACITY 160u
 #define PLAYER_MESSAGE_CAPACITY 128u
 #define PLAYER_PLAYLIST_COUNT 8u
-#define PLAYER_BOOKMARK_COUNT 8u
 #define PLAYER_MENU_COUNT 8u
 #define PLAYER_MENU_ITEM_LIMIT 14u
 #define PLAYER_PREFS_SECTION_COUNT 6u
+#define PLAYER_FFT_POINTS 32u
+#define PLAYER_FFT_BINS (PLAYER_FFT_POINTS / 2u)
+#define PLAYER_FFT_PCM_BYTES (PLAYER_FFT_POINTS * 4u)
 
 #define PL_BACKGROUND 0x101010u
 #define PL_PANEL 0x1c1c1cu
@@ -61,6 +63,9 @@
 #define CMD_VIEW_NOW 27u
 #define CMD_STATUS_BAR 28u
 #define CMD_ABOUT 29u
+#define CMD_REPEAT_NONE 30u
+#define CMD_REPEAT_ALL 31u
+#define CMD_REPEAT_ONE 32u
 
 enum player_view {
     PLAYER_VIEW_NOW_PLAYING,
@@ -73,7 +78,8 @@ enum player_dialog {
     PLAYER_DIALOG_NONE,
     PLAYER_DIALOG_OPEN,
     PLAYER_DIALOG_GOTO,
-    PLAYER_DIALOG_BOOKMARKS
+    PLAYER_DIALOG_BOOKMARKS,
+    PLAYER_DIALOG_CONFIRM_STREAM
 };
 
 enum player_open_tab {
@@ -87,21 +93,15 @@ enum player_drag {
     PLAYER_DRAG_VOLUME
 };
 
-struct player_bookmark {
-    uint32_t position_ms;
-    char label[24u];
-};
-
 struct player_state {
     char path[PLAYER_PATH_CAPACITY];
     char url[BOOK8_MEDIA_URL_CAPACITY];
     char goto_field[16u];
     char message[PLAYER_MESSAGE_CAPACITY];
     char playlist[PLAYER_PLAYLIST_COUNT][PLAYER_PATH_CAPACITY];
-    struct player_bookmark bookmarks[PLAYER_BOOKMARK_COUNT];
+    struct book8_media_bookmark_set bookmarks;
     uint32_t playlist_count;
     uint32_t playlist_index;
-    uint32_t bookmark_count;
     uint32_t position_ms;
     uint32_t duration_ms;
     struct book8_media_preferences prefs;
@@ -121,6 +121,7 @@ struct player_state {
     enum player_dialog dialog;
     enum player_open_tab open_tab;
     enum player_drag drag;
+    uint8_t repeat_counter; /* software repeat: counts down to auto-restart */
 };
 
 struct menu_entry {
@@ -157,6 +158,9 @@ static const struct menu_entry menu_items[PLAYER_MENU_COUNT][PLAYER_MENU_ITEM_LI
         {CMD_AUDIO_MONO, "Audio Track: Mono", ""},
         {CMD_SEPARATOR, "", NULL},
         {CMD_MUTE, "Mute", "M"},
+        {CMD_REPEAT_NONE, "Repeat: Off", ""},
+        {CMD_REPEAT_ALL, "Repeat: All", ""},
+        {CMD_REPEAT_ONE, "Repeat: One", ""},
         {CMD_VISUALIZATION, "Visualizations", ""},
         {CMD_MAX_VOLUME, "Maximum Volume...", ""}
     },
@@ -448,6 +452,17 @@ static struct book8gui_rect goto_cancel_rect(const struct player_layout *layout)
         dialog.y + 64u, 64u, 22u};
 }
 
+static struct book8gui_rect confirm_open_rect(const struct player_layout *layout)
+{
+    return goto_ok_rect(layout);
+}
+
+static struct book8gui_rect confirm_cancel_rect(
+    const struct player_layout *layout)
+{
+    return goto_cancel_rect(layout);
+}
+
 static struct book8gui_rect prefs_panel(const struct player_layout *layout)
 {
     return (struct book8gui_rect){layout->client.x + 2u,
@@ -602,6 +617,11 @@ static bool start_wav(const struct book8gui_platform *p,
             player.path);
         player.playlist_count = 1u;
         player.playlist_index = 0u;
+    }
+    if (!book8_media_bookmarks_load(p, player.path, &player.bookmarks)) {
+        memset(&player.bookmarks, 0, sizeof(player.bookmarks));
+        snprintf(player.bookmarks.path, sizeof(player.bookmarks.path), "%s",
+            player.path);
     }
     player.failed = false;
     set_message("Playing PCM 48 kHz stereo WAV.");
@@ -899,22 +919,39 @@ static void toggle_mute(const struct book8gui_platform *p)
     book8gui_invalidate();
 }
 
-static void create_bookmark(void)
+static void create_bookmark(const struct book8gui_platform *p)
 {
-    if (player.bookmark_count >= PLAYER_BOOKMARK_COUNT) {
-        set_message("Bookmark list is full.");
+    if (player.path[0] == '\0' || !player.loaded) {
+        set_message("Load a WAV file before creating a bookmark.");
         book8gui_invalidate();
         return;
     }
-    struct player_bookmark *bookmark = &player.bookmarks[player.bookmark_count];
+    struct book8_media_bookmark_set saved;
+    if (!book8_media_bookmarks_load(p, player.path, &saved)) {
+        memset(&saved, 0, sizeof(saved));
+        snprintf(saved.path, sizeof(saved.path), "%s", player.path);
+    }
+    if (saved.count >= BOOK8_MEDIA_BOOKMARK_MAX_PER_MEDIA) {
+        set_message("Bookmark list is full.");
+        player.bookmarks = saved;
+        book8gui_invalidate();
+        return;
+    }
+    struct book8_media_bookmark *bookmark = &saved.bookmarks[saved.count];
     bookmark->position_ms = player.position_ms;
     char current[12u], total[12u];
     format_time(player.position_ms, current, sizeof(current));
     format_time(player.duration_ms, total, sizeof(total));
     snprintf(bookmark->label, sizeof(bookmark->label), "%.9s/%.9s", current,
         total);
-    ++player.bookmark_count;
-    set_message("Bookmark created.");
+    ++saved.count;
+    if (!book8_media_bookmarks_save(p, player.path, &saved)) {
+        set_message("Bookmark could not be saved to A:\\MEDIA.BMK.");
+        book8gui_invalidate();
+        return;
+    }
+    player.bookmarks = saved;
+    set_message("Bookmark saved to A:\\MEDIA.BMK.");
     book8gui_invalidate();
 }
 
@@ -980,7 +1017,7 @@ static void execute_command(const struct book8gui_platform *p,
         player.dialog = PLAYER_DIALOG_GOTO;
         break;
     case CMD_BOOKMARK_CREATE:
-        create_bookmark();
+        create_bookmark(p);
         break;
     case CMD_BOOKMARKS:
         player.dialog = PLAYER_DIALOG_BOOKMARKS;
@@ -1009,6 +1046,24 @@ static void execute_command(const struct book8gui_platform *p,
         break;
     case CMD_MUTE:
         toggle_mute(p);
+        break;
+    case CMD_REPEAT_NONE:
+        player.prefs.repeat = BOOK8_MEDIA_REPEAT_NONE;
+        player.repeat_counter = 0u;
+        (void)book8_media_prefs_save(p, &player.prefs);
+        set_message("Repeat: off.");
+        break;
+    case CMD_REPEAT_ALL:
+        player.prefs.repeat = BOOK8_MEDIA_REPEAT_ALL;
+        player.repeat_counter = 0u;
+        (void)book8_media_prefs_save(p, &player.prefs);
+        set_message("Repeat: all tracks.");
+        break;
+    case CMD_REPEAT_ONE:
+        player.prefs.repeat = BOOK8_MEDIA_REPEAT_ONE;
+        player.repeat_counter = 0u;
+        (void)book8_media_prefs_save(p, &player.prefs);
+        set_message("Repeat: one track.");
         break;
     case CMD_VISUALIZATION:
         player.prefs.plugins ^= BOOK8_MEDIA_PLUGIN_VISUALIZATION;
@@ -1086,6 +1141,88 @@ static void draw_cone(const struct book8gui_platform *p,
     p->fill_rect(center_x - 22u, center_y + 47u, 44u, 3u, PL_BORDER);
 }
 
+/* Q15 twiddles for a 32-point radix-2 FFT: round(32767 * cos/sin(2*pi*k/32)).
+ * All arithmetic below is integer; no libm, double or SIMD is required. */
+static const int16_t player_fft_cos[PLAYER_FFT_BINS] = {
+    32767, 32137, 30273, 27245, 23170, 18204, 12539, 6393,
+    0, -6393, -12539, -18204, -23170, -27245, -30273, -32137
+};
+static const int16_t player_fft_sin[PLAYER_FFT_BINS] = {
+    0, 6393, 12539, 18204, 23170, 27245, 30273, 32137,
+    32767, 32137, 30273, 27245, 23170, 18204, 12539, 6393
+};
+
+static int32_t player_abs32(int32_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+static int16_t player_read_pcm_sample(const uint8_t *bytes)
+{
+    uint16_t value = (uint16_t)bytes[0u] | (uint16_t)((uint16_t)bytes[1u] << 8u);
+    return (int16_t)value;
+}
+
+static void player_pcm_fft(const uint8_t *pcm, uint32_t size,
+    uint64_t position_bytes, uint32_t magnitudes[PLAYER_FFT_BINS])
+{
+    int32_t real[PLAYER_FFT_POINTS] = {0};
+    int32_t imaginary[PLAYER_FFT_POINTS] = {0};
+    uint32_t start = 0u;
+
+    if (pcm != NULL && size >= PLAYER_FFT_PCM_BYTES) {
+        uint64_t requested = position_bytes & ~3ull;
+        if (requested > size) {
+            requested = size;
+        }
+        start = (uint32_t)requested;
+        if (start > size - PLAYER_FFT_PCM_BYTES) {
+            start = size - PLAYER_FFT_PCM_BYTES;
+        }
+        start &= ~3u;
+    }
+    /* DIT butterflies require bit-reversed input and yield natural-order bins. */
+    for (uint32_t i = 0u; i < PLAYER_FFT_POINTS; ++i) {
+        uint32_t offset = start + i * 4u;
+        if (pcm != NULL && offset + 4u <= size) {
+            int32_t left = player_read_pcm_sample(pcm + offset);
+            int32_t right = player_read_pcm_sample(pcm + offset + 2u);
+            uint32_t reversed = ((i & 1u) << 4u) | ((i & 2u) << 2u)
+                | (i & 4u) | ((i & 8u) >> 2u) | ((i & 16u) >> 4u);
+            real[reversed] = (left + right) / 2;
+        }
+    }
+
+    for (uint32_t length = 2u; length <= PLAYER_FFT_POINTS; length <<= 1u) {
+        uint32_t half = length >> 1u;
+        uint32_t step = PLAYER_FFT_POINTS / length;
+        for (uint32_t base = 0u; base < PLAYER_FFT_POINTS; base += length) {
+            for (uint32_t j = 0u; j < half; ++j) {
+                uint32_t twiddle = (j * step) & (PLAYER_FFT_POINTS - 1u);
+                int64_t wr = player_fft_cos[twiddle];
+                int64_t wi = player_fft_sin[twiddle];
+                uint32_t even = base + j;
+                uint32_t odd = even + half;
+                int32_t tr = (int32_t)((wr * real[odd]
+                    - wi * imaginary[odd]) >> 15u);
+                int32_t ti = (int32_t)((wi * real[odd]
+                    + wr * imaginary[odd]) >> 15u);
+                int32_t er = real[even], ei = imaginary[even];
+                real[even] = er + tr;
+                imaginary[even] = ei + ti;
+                real[odd] = er - tr;
+                imaginary[odd] = ei - ti;
+            }
+        }
+    }
+
+    for (uint32_t i = 0u; i < PLAYER_FFT_BINS; ++i) {
+        int32_t re = player_abs32(real[i]);
+        int32_t im = player_abs32(imaginary[i]);
+        magnitudes[i] = (uint32_t)(re + im / 2);
+    }
+}
+
 static void draw_visualization(const struct book8gui_platform *p,
     const struct book8gui_rect *canvas)
 {
@@ -1093,20 +1230,38 @@ static void draw_visualization(const struct book8gui_platform *p,
         || !player.playing || player.paused || canvas->height < 24u) {
         return;
     }
-    uint32_t tick = p->clock_ticks != NULL && p->clock_hz != 0u
-        ? (uint32_t)(p->clock_ticks() / p->clock_hz) : 0u;
+    const uint8_t *pcm = NULL;
+    uint32_t pcm_size = 0u;
+    uint64_t position_bytes = 0u;
+    uint32_t magnitudes[PLAYER_FFT_BINS] = {0};
+    uint32_t maximum = 0u;
+    if (p->media_pcm_window != NULL
+        && p->media_pcm_window(&pcm, &pcm_size, &position_bytes)) {
+        player_pcm_fft(pcm, pcm_size, position_bytes, magnitudes);
+        for (uint32_t i = 0u; i < PLAYER_FFT_BINS; ++i) {
+            if (magnitudes[i] > maximum) {
+                maximum = magnitudes[i];
+            }
+        }
+    }
     uint32_t columns = canvas->width / 12u;
     if (columns > 32u) {
         columns = 32u;
     }
+    uint32_t maximum_height = canvas->height / 2u;
     uint32_t base_y = canvas->y + canvas->height - 4u;
     for (uint32_t i = 0u; i < columns; ++i) {
-        uint32_t height = 3u + ((tick * 7u + i * 13u) % 17u);
-        if (height > canvas->height / 2u) {
-            height = canvas->height / 2u;
+        uint32_t height = 3u;
+        if (maximum != 0u && maximum_height > 3u) {
+            uint64_t scaled = (uint64_t)magnitudes[i % PLAYER_FFT_BINS]
+                * (maximum_height - 3u);
+            height = 3u + (uint32_t)(scaled / maximum);
+        }
+        if (height > maximum_height) {
+            height = maximum_height;
         }
         p->fill_rect(canvas->x + 6u + i * 12u, base_y - height, 8u, height,
-            height > 12u ? PL_ORANGE : PL_GREEN);
+            PL_GREEN);
     }
 }
 
@@ -1470,6 +1625,25 @@ static void render_goto_dialog(const struct book8gui_platform *p,
     draw_button(p, goto_cancel_rect(layout), "Cancel", false);
 }
 
+static void render_confirm_stream_dialog(const struct book8gui_platform *p,
+    const struct player_layout *layout)
+{
+    struct book8gui_rect dialog = goto_dialog_rect(layout);
+    p->fill_rect(dialog.x, dialog.y, dialog.width, dialog.height, PL_PANEL);
+    p->fill_rect(dialog.x, dialog.y, dialog.width, 1u, PL_ORANGE);
+    p->fill_rect(dialog.x, dialog.y + dialog.height - 1u, dialog.width, 1u,
+        PL_BORDER);
+    p->draw_text(dialog.x + 12u, dialog.y + 8u, "Open Network Stream",
+        PL_TEXT, PL_PANEL);
+    p->draw_text(dialog.x + 12u, dialog.y + 28u,
+        "This opens the URL in Web Browser.", PL_MUTED, PL_PANEL);
+    draw_text_clipped(p, dialog.x + 12u, dialog.y + 46u,
+        dialog.width > 24u ? dialog.width - 24u : 0u, player.url,
+        PL_TEXT, PL_PANEL);
+    draw_button(p, confirm_open_rect(layout), "Open", false);
+    draw_button(p, confirm_cancel_rect(layout), "Cancel", false);
+}
+
 static void render_bookmarks_dialog(const struct book8gui_platform *p,
     const struct player_layout *layout)
 {
@@ -1478,12 +1652,16 @@ static void render_bookmarks_dialog(const struct book8gui_platform *p,
     p->fill_rect(dialog.x, dialog.y, dialog.width, 1u, PL_ORANGE);
     p->draw_text(dialog.x + 12u, dialog.y + 7u, "Custom Bookmarks",
         PL_TEXT, PL_PANEL);
-    for (uint32_t i = 0u; i < player.bookmark_count && i < 2u; ++i) {
+    if (player.bookmarks.count == 0u) {
+        p->draw_text(dialog.x + 12u, dialog.y + 30u,
+            "No bookmarks saved for this file.", PL_MUTED, PL_PANEL);
+    }
+    for (uint32_t i = 0u; i < player.bookmarks.count && i < 2u; ++i) {
         struct book8gui_rect row = {dialog.x + 12u, dialog.y + 26u + i * 18u,
             dialog.width - 24u, 18u};
         p->fill_rect(row.x, row.y, row.width, row.height, PL_BUTTON);
-        p->draw_text(row.x + 4u, row.y + 3u, player.bookmarks[i].label,
-            PL_TEXT, PL_BUTTON);
+        p->draw_text(row.x + 4u, row.y + 3u,
+            player.bookmarks.bookmarks[i].label, PL_TEXT, PL_BUTTON);
     }
     draw_button(p, goto_cancel_rect(layout), "Close", false);
 }
@@ -1537,6 +1715,8 @@ static void render(const struct book8gui_platform *p, struct WindowApp *app)
         render_goto_dialog(p, &layout);
     } else if (player.dialog == PLAYER_DIALOG_BOOKMARKS) {
         render_bookmarks_dialog(p, &layout);
+    } else if (player.dialog == PLAYER_DIALOG_CONFIRM_STREAM) {
+        render_confirm_stream_dialog(p, &layout);
     }
     if ((player.prefs.interface_flags & BOOK8_MEDIA_IF_STATUS) != 0u
         && player.dialog == PLAYER_DIALOG_NONE
@@ -1604,15 +1784,14 @@ static char *focused_text(uint32_t *capacity)
         *capacity = sizeof(player.path);
         return player.path;
     }
-    if (player.url_focused) {
-        *capacity = sizeof(player.url);
-        return player.url;
-    }
-    if (player.path_focused) {
-        *capacity = sizeof(player.path);
-        return player.path;
-    }
     return NULL;
+}
+
+static void accept_network_stream(const struct book8gui_platform *p)
+{
+    player.dialog = PLAYER_DIALOG_NONE;
+    player.url_focused = false;
+    play_url(p);
 }
 
 static void open_dialog_activate(const struct book8gui_platform *p,
@@ -1622,10 +1801,15 @@ static void open_dialog_activate(const struct book8gui_platform *p,
         player.dialog = PLAYER_DIALOG_NONE;
         player.path_focused = false;
         (void)start_wav(p, app);
+    } else if (player.url[0] == '\0') {
+        set_message("Enter an HTTP stream URL.");
+        book8gui_invalidate();
     } else {
-        player.dialog = PLAYER_DIALOG_NONE;
+        player.dialog = PLAYER_DIALOG_CONFIRM_STREAM;
+        player.path_focused = false;
         player.url_focused = false;
-        play_url(p);
+        set_message("Confirm opening the stream in Web Browser.");
+        book8gui_invalidate();
     }
 }
 
@@ -1661,6 +1845,17 @@ static bool handle_key(const struct book8gui_platform *p,
         return false;
     }
 
+    if (player.dialog == PLAYER_DIALOG_CONFIRM_STREAM) {
+        if (key == BOOK8GUI_KEY_ENTER || key == 'y' || key == 'Y') {
+            accept_network_stream(p);
+        } else if (key == BOOK8GUI_KEY_ESCAPE || key == 'n'
+            || key == 'N') {
+            player.dialog = PLAYER_DIALOG_NONE;
+            set_message("Network stream cancelled.");
+            book8gui_invalidate();
+        }
+        return true;
+    }
     if (player.dialog == PLAYER_DIALOG_BOOKMARKS
         || player.dialog == PLAYER_DIALOG_GOTO) {
         if (key == BOOK8GUI_KEY_ESCAPE) {
@@ -1845,6 +2040,20 @@ static bool handle_goto_click(const struct book8gui_platform *p,
     return true;
 }
 
+static bool handle_confirm_stream_click(const struct book8gui_platform *p,
+    const struct player_layout *layout, const struct book8gui_event *event)
+{
+    if (inside(confirm_open_rect(layout), event->mouse_x, event->mouse_y)) {
+        accept_network_stream(p);
+    } else if (inside(confirm_cancel_rect(layout), event->mouse_x,
+        event->mouse_y)) {
+        player.dialog = PLAYER_DIALOG_NONE;
+        set_message("Network stream cancelled.");
+        book8gui_invalidate();
+    }
+    return true;
+}
+
 static bool handle_bookmark_click(const struct book8gui_platform *p,
     const struct player_layout *layout, const struct book8gui_event *event)
 {
@@ -1854,11 +2063,11 @@ static bool handle_bookmark_click(const struct book8gui_platform *p,
         book8gui_invalidate();
         return true;
     }
-    for (uint32_t i = 0u; i < player.bookmark_count && i < 2u; ++i) {
+    for (uint32_t i = 0u; i < player.bookmarks.count && i < 2u; ++i) {
         struct book8gui_rect row = {dialog.x + 12u, dialog.y + 26u + i * 18u,
             dialog.width - 24u, 18u};
         if (inside(row, event->mouse_x, event->mouse_y)) {
-            seek_to_position(p, player.bookmarks[i].position_ms);
+            seek_to_position(p, player.bookmarks.bookmarks[i].position_ms);
             player.dialog = PLAYER_DIALOG_NONE;
             book8gui_invalidate();
             return true;
@@ -1999,6 +2208,8 @@ static bool handle_event(const struct book8gui_platform *p,
             handle_goto_click(p, &layout, event);
         } else if (player.dialog == PLAYER_DIALOG_BOOKMARKS) {
             handle_bookmark_click(p, &layout, event);
+        } else if (player.dialog == PLAYER_DIALOG_CONFIRM_STREAM) {
+            handle_confirm_stream_click(p, &layout, event);
         } else if (player.view == PLAYER_VIEW_PREFERENCES) {
             handle_preferences_click(p, &layout, event);
         } else if (player.view == PLAYER_VIEW_ABOUT) {

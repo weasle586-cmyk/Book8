@@ -7,7 +7,12 @@ network_config="${3:-}"
 target_output="${4:-${output%.img}-target.img}"
 helper="$(dirname -- "$kernel")/user/nvmap.elf"
 utilities="$(dirname -- "$kernel")/user"
+hash_image="$(dirname -- "$kernel")/book8-hashes.bin"
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "$hash_image" ]]; then
+    printf 'Boot hash manifest is missing: %s\n' "$hash_image" >&2
+    exit 1
+fi
 if [[ "$EUID" -ne 0 ]]; then
     printf 'Building the installer image requires root for loop-device setup.\n' >&2
     exit 1
@@ -46,9 +51,24 @@ if [[ ! -f "$kernel" ]]; then
     printf 'Kernel image not found: %s\n' "$kernel" >&2
     exit 1
 fi
+docs=(
+    "README.md:README.MD"
+    "DEVREADME.md:DEVREAD.MD"
+    "KERNEL_NOTES.md:KERNELNO.MD"
+    "CHECKPOINT.md:CHECKPT.MD"
+    "OPENCODE_MAP.txt:OPENCODE.MAP"
+    "INSTALLER.txt:INSTALL.TXT"
+)
 for file in "$helper" "$root/user/nvmap.cfg" "$utilities/cat.elf" "$utilities/hello.elf" "$utilities/msg.txt"; do
     if [[ ! -s "$file" ]]; then
         printf 'Required installer startup file missing: %s\n' "$file" >&2
+        exit 1
+    fi
+done
+for mapping in "${docs[@]}"; do
+    source="${mapping%%:*}"
+    if [[ ! -s "$root/$source" ]]; then
+        printf 'Required BOOK8 documentation missing: %s\n' "$source" >&2
         exit 1
     fi
 done
@@ -105,8 +125,9 @@ fi
 
 mkfs.vfat -F 32 -n BOOK8 "$partition" >/dev/null
 mount "$partition" "$mount_point"
-mkdir -p "$mount_point/boot/grub" "$mount_point/EFI/BOOT" "$mount_point/BIN" "$mount_point/DATA"
+mkdir -p "$mount_point/boot/grub" "$mount_point/EFI/BOOT" "$mount_point/BIN" "$mount_point/DATA" "$mount_point/DOC"
 cp "$kernel" "$mount_point/boot/book8.elf"
+cp "$hash_image" "$mount_point/boot/book8-hashes.bin"
 cp "$helper" "$mount_point/NVMAP.ELF"
 cp "$root/user/nvmap.cfg" "$mount_point/NVMAP.CFG"
 while IFS='|' read -r source target app_key display_name app_class hidden system_component; do
@@ -117,6 +138,12 @@ done < "$root/installer/apps.manifest"
 cp "$utilities/cat.elf" "$mount_point/CAT.ELF"
 cp "$utilities/hello.elf" "$mount_point/HELLO.ELF"
 cp "$utilities/msg.txt" "$mount_point/DATA/MSG.TXT"
+for mapping in "${docs[@]}"; do
+    source="${mapping%%:*}"
+    target="${mapping##*:}"
+    cp "$root/$source" "$mount_point/DOC/$target"
+    cmp "$root/$source" "$mount_point/DOC/$target"
+done
 if [[ -n "$network_config" ]]; then
     cp "$network_config" "$mount_point/BOOK8NET.CFG"
 fi
@@ -133,6 +160,7 @@ set gfxpayload=keep
 menuentry "BOOK8 x86-64" {
     search --no-floppy --label BOOK8 --set=root
     multiboot2 /boot/book8.elf
+    module2 /boot/book8-hashes.bin book8-hashes
     boot
 }
 EOF

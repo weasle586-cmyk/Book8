@@ -175,15 +175,48 @@ def wait_for_shell(log_path, process, timeout=60):
     wait_for_text(log_path, process, "A:\\> ", timeout)
 
 
-def verify_framebuffer_handoff(log_path, process):
-    log = wait_for_text(log_path, process, "BOOK8 framebuffer handoff:", 60)
-    match = re.search(
-        r"BOOK8 framebuffer handoff: (\d+)x(\d+)x(24|32) "
-        r"pitch=(\d+) address=0x([0-9a-fA-F]+)",
-        log,
+def sign_in_if_prompted(log_path, process):
+    log = log_path.read_text(errors="replace")
+    if 'title="BOOK8 Sign In" registered' not in log:
+        return
+    process.stdin.write(b"default\r")
+    process.stdin.flush()
+    wait_for_text(
+        log_path, process, "BOOK8-SESSION: login accepted uid=0", 10
     )
-    if match is None:
-        raise RuntimeError(f"Installer did not initialize a linear framebuffer:\n{log}")
+
+
+def verify_installed_programs(log_path, process):
+    log = wait_for_text(log_path, process, "Programs indexed: 12;", timeout=10)
+    if "PaintBook" in log:
+        raise RuntimeError(
+            "Deselected PaintBook was indexed on the installed image:\n" + log
+        )
+    return log
+
+
+def verify_framebuffer_handoff(log_path, process):
+    pattern = re.compile(
+        r"BOOK8 framebuffer handoff: (\d+)x(\d+)x(24|32) "
+        r"pitch=(\d+) address=0x([0-9a-fA-F]+)"
+    )
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                "QEMU exited before the installer framebuffer line completed:\n"
+                + log_path.read_text(errors="replace")
+            )
+        log = log_path.read_text(errors="replace")
+        match = pattern.search(log)
+        if match is not None:
+            break
+        time.sleep(0.1)
+    else:
+        raise TimeoutError(
+            "Timed out waiting for a complete installer framebuffer line:\n"
+            + log_path.read_text(errors="replace")
+        )
     width, height, bpp, pitch = (int(value) for value in match.groups()[:4])
     address = int(match.group(5), 16)
     if (width < 640 or height < 480 or pitch < width * (bpp // 8)
@@ -587,6 +620,16 @@ def main():
             wait_for_text(
                 installer_log,
                 process,
+                "Install applications ([A]ll default, [N]one, [S]elect, Q to cancel):",
+                10,
+            )
+            # Select the apps explicitly and deselect PaintBook (index 4) so
+            # the installer's per-app filtering is observable on disk.
+            process.stdin.write(b"S\rY\rY\rY\rN\rY\rY\r")
+            process.stdin.flush()
+            wait_for_text(
+                installer_log,
+                process,
                 "[INSTALL] copying installer image to target...",
                 10,
             )
@@ -612,6 +655,15 @@ def main():
                 ).stdout
                 if extracted != source.read_bytes():
                     raise RuntimeError(f"Installed {name} differs from build input")
+            deselected = subprocess.run(
+                ["mtype", "-i", f"{target}@@1048576", "::/BIN/PAINTBK.ELF"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if deselected.returncode == 0:
+                raise RuntimeError(
+                    "Installer wrote PAINTBK.ELF after it was deselected"
+                )
             for name in ("BOOK8.CFG", "BOOK8REG.INI"):
                 extracted = subprocess.run(
                     ["mtype", "-i", f"{target}@@1048576", f"::/{name}"],
@@ -658,7 +710,8 @@ def main():
                 bios_log, bios, "BOOK8-CONFIG: Loaded A:\\BOOK8.CFG.", timeout=30
             )
             wait_for_text(bios_log, bios, "BOOK8-DESKTOP: TASKBAR", timeout=30)
-            wait_for_text(bios_log, bios, "Programs indexed: 16;", timeout=10)
+            sign_in_if_prompted(bios_log, bios)
+            verify_installed_programs(bios_log, bios)
             if "NVMAP:" in bios_log.read_text(errors="replace") or "BOOK8-PUSH:" in bios_log.read_text(errors="replace"):
                 raise RuntimeError("installed BIOS boot started disabled diagnostics or push")
             stop_qemu(bios)
@@ -695,7 +748,8 @@ def main():
                 efi_log, efi, "BOOK8-CONFIG: Loaded A:\\BOOK8.CFG.", timeout=30
             )
             wait_for_text(efi_log, efi, "BOOK8-DESKTOP: TASKBAR", timeout=30)
-            wait_for_text(efi_log, efi, "Programs indexed: 16;", timeout=10)
+            sign_in_if_prompted(efi_log, efi)
+            verify_installed_programs(efi_log, efi)
             if "NVMAP:" in efi_log.read_text(errors="replace") or "BOOK8-PUSH:" in efi_log.read_text(errors="replace"):
                 raise RuntimeError("installed UEFI boot started disabled diagnostics or push")
             stop_qemu(efi)
@@ -712,7 +766,7 @@ def main():
         print("PASS: PS/2 and USB keyboard input, USB mouse GUI input, REBOOT command")
     print(
         "PASS: QEMU "
-        "installer cancellation/install, exact packaged files, "
+        "installer cancellation/install, app deselection, exact packaged files, "
         "and automatic desktop without NVMAP/push on BIOS/UEFI cold boot."
     )
 

@@ -357,10 +357,17 @@ enum book8_net_result book8_dhcp_poll(struct book8_dhcp *d, uint64_t now)
         d->pending = 0u;
         state_set(d, BOOK8_DHCP_REQUESTING);
     } else if (d->pending == 5u) {
-        enum book8_net_result result = book8_net_configure(d->net,
-            d->pending_ip, d->pending_mask, d->pending_gateway);
-        if (result != BOOK8_NET_OK)
-            return result;
+        /* NETSAVE static IP persists beyond the 30s DHCP timeout: once the
+           fallback is active, a late ACK must not overwrite the saved IPv4
+           settings. DNS/lease metadata is still recorded for diagnostics. */
+        if (!d->fallback_active) {
+            enum book8_net_result result = book8_net_configure(d->net,
+                d->pending_ip, d->pending_mask, d->pending_gateway);
+            if (result != BOOK8_NET_OK)
+                return result;
+        } else {
+            d->log("Late DHCP ACK ignored; NETSAVE static IP retained");
+        }
         d->server = d->pending_server;
         d->dns = d->pending_dns;
         d->lease_seconds = d->pending_lease;
@@ -371,7 +378,7 @@ enum book8_net_result book8_dhcp_poll(struct book8_dhcp *d, uint64_t now)
         d->rebind_at = d->lease_seconds == UINT32_MAX ? UINT64_MAX
             : now + (uint64_t)d->pending_t2 * 1000u;
         d->pending = 0u;
-        d->fallback_active = false;
+        /* fallback_active is intentionally left set when a static IP is in use. */
         ++d->generation;
         state_set(d, BOOK8_DHCP_BOUND);
         return BOOK8_NET_OK;

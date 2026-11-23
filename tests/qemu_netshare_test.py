@@ -14,10 +14,9 @@ from pathlib import Path
 
 import qemu_control_panel_test as panel
 import qemu_graphics_input_smoke as smoke
+import qemu_ui_lookup as ui
 from qemu_utilities_test import (
     exit_desktop,
-    program_menu_rows,
-    program_row_y,
     screenshot_region,
     type_text,
 )
@@ -121,10 +120,8 @@ def main():
                                               client_x + 3, client_y + 20, 88, 16)
             monitor.click(width - 14, 12)
             smoke.wait_for(serial, process, "WINDOW closed id=1")
-            monitor.click(20, height - 18)
-            monitor.click(40, height - 90)
-            rows = program_menu_rows(serial)
-            monitor.click(200, program_row_y(height, 8, rows))
+            ui.click_program(monitor, serial, height, process=process,
+                             path="A:\\BIN\\NETSHARE.ELF")
             smoke.wait_for(serial, process, 'title="Local Network Share Browser" registered', occurrences=2)
             monitor.click(20, height - 18)
             monitor.click(40, height - 70)

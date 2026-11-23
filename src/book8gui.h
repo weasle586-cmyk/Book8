@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "../include/syscall.h"
 #include "filesystem.h"
 #include "system_config.h"
 #include "mouse_input.h"
@@ -85,6 +86,7 @@ struct book8gui_rect {
 struct book8gui_platform;
 struct WindowApp;
 struct book8_nvdiag_snapshot;
+struct book8_platform_info;
 
 typedef void (*book8gui_render_fn)(const struct book8gui_platform *platform,
     struct WindowApp *app);
@@ -239,6 +241,10 @@ struct book8gui_platform {
     void (*media_stop)(void);
     bool (*media_seek)(uint32_t position_ms);
     bool (*media_state)(struct book8gui_media_status *status);
+    /* Optional live PCM window for the player's integer FFT visualizer.
+     * position_bytes is the playback cursor inside pcm. */
+    bool (*media_pcm_window)(const uint8_t **pcm, uint32_t *size,
+        uint64_t *position_bytes);
     void (*media_service)(void);
     bool (*read_time)(struct book8gui_time *time);
     /* Optional: writes the hardware clock; false for invalid values. */
@@ -295,6 +301,8 @@ struct book8gui_platform {
     bool (*launch_program)(const char *path);
     bool (*launch_utility)(uint32_t kind, const char *document);
     bool (*nvdiag_snapshot)(struct book8_nvdiag_snapshot *snapshot);
+    /* Optional live board/BIOS/CPU/RAM/firmware inventory for NV Diagnostic. */
+    bool (*platform_info)(struct book8_platform_info *info);
     bool (*read_cluster)(char drive, uint32_t cluster, void *data,
         uint32_t capacity, uint32_t *size);
     struct book8_net *(*network)(void);
@@ -302,7 +310,7 @@ struct book8gui_platform {
     bool (*create_file)(const char *path, const void *data, uint32_t size);
 };
 
-#define BOOK8GUI_MAX_PROGRAMS 512u
+#define BOOK8GUI_MAX_PROGRAMS BOOK8_MAX_PROGRAMS
 #define BOOK8GUI_PROGRAM_PATH_SIZE 512u
 struct book8gui_program {
     char name[96];

@@ -1,5 +1,6 @@
 #include "../kernel/exec.h"
 #include "../kernel/sched.h"
+#include "../kernel/vmm.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +16,8 @@ void book8_write_cr3(uint64_t value) { fake_cr3 = value; ++cr3_writes; }
 uint32_t book8_smp_current_cpu_index(void) { return test_cpu_id; }
 void book8_sched_request_reschedule(uint32_t cpu_id) { (void)cpu_id; }
 void syscall_select_task(struct exec_task *task) { assert(task != 0); }
+void fs_close(file_handle_t *file) { (void)file; }
+void vmm_free_pages(void *base, uint32_t count) { (void)base; (void)count; }
 
 int main(void)
 {

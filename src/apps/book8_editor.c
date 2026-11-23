@@ -12,7 +12,8 @@
  * window bounds).
  */
 
-#define ED_CAPACITY 65536u
+/* Must hold the largest packaged BOOK8 document (README.md, about 104 KiB). */
+#define ED_CAPACITY 131072u
 #define ED_NAME 128u
 #define ED_FIELD 120u
 #define ED_MAX_COLS 256u

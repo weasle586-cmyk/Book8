@@ -6,6 +6,15 @@
 
 #define B8_HDA_MODULE_API_VERSION 1u
 #define B8_HDA_IOCTL_GET_API 1u
+#define B8_HDA_IOCTL_GET_PCM_WINDOW 2u
+
+/* GUI visualization hook data. This is an ioctl payload, not an extension of
+ * the versioned b8_hda_module_api struct above. */
+struct b8_hda_pcm_window {
+    const uint8_t *pcm;
+    uint32_t size;
+    uint64_t position_bytes;
+};
 
 struct b8_hda_module_api {
     uint32_t abi_version;

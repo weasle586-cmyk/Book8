@@ -9,8 +9,12 @@
 static uint8_t elf[0x6000];
 static uint8_t mbi[4096];
 static uint8_t plan[BOOK8_RELAUNCH_PLAN_BYTES];
-static const uint64_t ELF_PHYS = 0x04400000u;
-static const uint64_t PLAN_PHYS = 0x04c00000u - BOOK8_RELAUNCH_PLAN_BYTES;
+/* Mirrors BOOK8_NETBOOT_ADDRESS and BOOK8_TFTP_CAPACITY in net/net.h. */
+static const uint64_t NETBOOT_PHYS = 0x05000000u;
+static const uint64_t NETBOOT_CAPACITY = 8u * 1024u * 1024u;
+static const uint64_t ELF_PHYS = NETBOOT_PHYS;
+static const uint64_t PLAN_PHYS = NETBOOT_PHYS + NETBOOT_CAPACITY
+    - BOOK8_RELAUNCH_PLAN_BYTES;
 
 static void p16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void p32(uint8_t *p, uint32_t v) { p16(p, (uint16_t)v); p16(p + 2, (uint16_t)(v >> 16)); }
@@ -144,7 +148,12 @@ static void plan_tests(void)
     CHECK(cmd != NULL && cmd == m + 8u);
     CHECK(strcmp((const char *)cmd + 8,
         "/boot/book8.elf book8.autostart=0 book8.relaunch=3") == 0);
-    CHECK(find_tag(m, 3u) == NULL);
+    /* GRUB modules (including the boot hash manifest) survive the restart. */
+    const uint8_t *module = find_tag(m, 3u);
+    CHECK(module != NULL && g32(module + 4) == 24u);
+    for (uint32_t i = 0u; i < 16u; ++i) {
+        CHECK(module[8u + i] == 0u);
+    }
     const uint8_t *meminfo = find_tag(m, 4u), *fb = find_tag(m, 8u);
     CHECK(meminfo != NULL && meminfo[8] == 1u && meminfo[15] == 8u);
     CHECK(fb != NULL && g32(fb + 4) == 21u && fb[20] == 9u);
@@ -221,6 +230,10 @@ static void real_kernel(const char *path)
     struct book8_relaunch_info info;
     enum book8_relaunch_result result = book8_relaunch_prepare(image, bytes, ELF_PHYS, mbi,
         plan, PLAN_PHYS, &info);
+    if (result != BOOK8_RELAUNCH_OK) {
+        printf("FAIL: %s relaunch: %s\n", path,
+            book8_relaunch_result_string(result));
+    }
     CHECK(result == BOOK8_RELAUNCH_OK);
     CHECK(info.entry >= 0x100000u && info.image_high < BOOK8_RELAUNCH_HIGH);
     printf("PASS: %s relaunch plan: entry=0x%llx image=0x%llx-0x%llx mbi=0x%llx\n", path,

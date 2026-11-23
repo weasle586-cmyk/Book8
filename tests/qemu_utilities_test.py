@@ -8,11 +8,11 @@ import subprocess
 import sys
 import tempfile
 import time
-import re
 from pathlib import Path
 
 import qemu_control_panel_test as panel
 import qemu_graphics_input_smoke as smoke
+import qemu_ui_lookup as ui
 from qemu_desktop_test import QemuMonitor
 
 
@@ -55,22 +55,18 @@ def exit_desktop(monitor, serial, process, height, occurrences=1):
 
 
 def program_menu_rows(serial):
-    log = smoke.read_serial(serial)
-    match = re.search(r"Programs indexed:\s*(\d+)", log)
-    if not match:
-        raise AssertionError("Program menu index count was not reported")
-    return max(9, int(match.group(1)))
+    """Backward-compatible wrapper; row identity now comes from book8gui."""
+    return ui.menu_row_count(serial)
 
 
 def program_row_y(height, row, rows):
-    panel_top = height - 36 - 2 - (rows * 20 + 4)
-    return panel_top + 2 + row * 20 + 10
+    return ui.row_y(height, row, rows)
 
 
-def launch_hex(monitor, height, rows):
-    monitor.click(20, height - 18)
-    monitor.click(40, height - 90)
-    monitor.click(200, program_row_y(height, 7, rows))
+def launch_hex(monitor, serial, process, height):
+    """Launch the Hex Viewer by its installed path, not a shifting row index."""
+    ui.click_program(monitor, serial, height, process=process,
+                     path="A:\\BIN\\HEXVIEW.ELF")
 
 
 def remove_program_at(monitor, index):
@@ -149,10 +145,8 @@ def main():
             type_text(monitor, "book8gui\n")
             smoke.wait_for(serial, process, "BOOK8-DESKTOP: TASKBAR", occurrences=2)
             monitor.reset_pointer()
-            monitor.click(20, height - 18)
-            monitor.click(40, height - 90)
-            rows = program_menu_rows(serial)
-            monitor.click(200, program_row_y(height, 5, rows))
+            ui.click_program(monitor, serial, height, process=process,
+                             label="File Explorer")
             smoke.wait_for(serial, process, 'title="File Explorer" registered')
             monitor.click(302, 52)
             monitor.click(60, 92)
@@ -176,7 +170,7 @@ def main():
             type_text(monitor, "book8gui\n")
             smoke.wait_for(serial, process, "BOOK8-DESKTOP: TASKBAR", occurrences=3)
             monitor.reset_pointer()
-            launch_hex(monitor, height, rows)
+            launch_hex(monitor, serial, process, height)
             smoke.wait_for(serial, process, 'title="Hex Sector Viewer" registered')
             hex_width = min(680, width - 8)
             hex_x = min(40, width - hex_width)

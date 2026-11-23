@@ -1,0 +1,50 @@
+name: BOOK8 build and QA
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-host-tests:
+    name: build.sh (host regression suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential dosfstools grub-pc-bin grub-efi-amd64-bin \
+            mtools ovmf python3 qemu-system-x86 qemu-utils util-linux xorriso
+
+      # build-installer-image.sh uses loop devices, so the script needs root.
+      # SKIP_RING3_SMOKE keeps the full host test suite but avoids a long QEMU
+      # suite on every PR; QEMU profiles remain available locally.
+      - name: Build and run host tests
+        run: sudo env BOOK8_SKIP_RING3_SMOKE=1 bash ./build.sh
+
+      - name: Upload boot images
+        uses: actions/upload-artifact@v4
+        with:
+          name: book8-images
+          path: |
+            build/book8.iso
+            build/book8-cli.iso
+          if-no-files-found: warn
+
+  config-matrix:
+    name: no-regression feature flag matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+      - name: Compile and run every supported flag combination
+        run: bash ./tests/build_matrix.sh

@@ -5,7 +5,9 @@
 #include "../src/book8gui.h"
 #include "../src/mouse_input.h"
 #include "../src/apps/book8_ui.h"
+#include "../src/apps/book8_explorer.h"
 #include "../src/apps/book8_editor.h"
+#include "../src/apps/book8_paintbook.h"
 #include "../src/apps/book8_player.h"
 #include "../src/apps/book8_settings.h"
 #include "../src/apps/book8_utilities.h"
@@ -69,6 +71,30 @@ static uint32_t program_deletes, program_launches;
 static bool saw_program_name, saw_program_path, saw_program_size, saw_program_core;
 static bool saw_remove_prompt;
 static bool utility_scenario;
+static bool open_with_scenario;
+static unsigned launch_utility_calls;
+static uint32_t launch_utility_kind;
+static char launch_utility_document[128];
+static bool saw_no_association_status;
+
+static const char *const open_with_files[] = {
+    "KIND0.TXT", "KIND1.INI", "KIND2.CFG", "KIND3.LOG",
+    "KIND4.C", "KIND5.H", "KIND6.ASM", "KIND7.PS1", "MYSTERY.XYZ"
+};
+
+static void seed_open_with_program(const char *id, const char *name,
+    const char *path, const char *app_class)
+{
+    char key[BOOK8_REGISTRY_KEY_MAX];
+    int length = snprintf(key, sizeof(key),
+        "HKLM\\SOFTWARE\\BOOK8\\Programs\\%s", id);
+    assert(length > 0 && (size_t)length < sizeof(key));
+    assert(reg_set_str(key, "Name", name));
+    assert(reg_set_str(key, "Path", path));
+    assert(reg_set_str(key, "AppClass", app_class));
+    assert(reg_set_u32(key, "Hidden", 0u));
+    assert(reg_set_u32(key, "SystemComponent", 0u));
+}
 
 static uint32_t host_session_uid(void)
 {
@@ -88,6 +114,15 @@ static bool launch_program(const char *path)
 {
     assert(strcmp(path, "A:\\BIN\\IMGVIEW.ELF") == 0);
     ++program_launches;
+    return true;
+}
+
+static bool host_launch_utility(uint32_t kind, const char *document)
+{
+    ++launch_utility_calls;
+    launch_utility_kind = kind;
+    snprintf(launch_utility_document, sizeof(launch_utility_document), "%s",
+        document == NULL ? "" : document);
     return true;
 }
 
@@ -230,6 +265,8 @@ static void present_rect(uint32_t x, uint32_t y, uint32_t width,
 static void draw_text(uint32_t x, uint32_t y, const char *text,
     uint32_t foreground, uint32_t background)
 {
+    if (open_with_scenario && strstr(text, "No usable file association") != NULL)
+        saw_no_association_status = true;
     if (programs_scenario) {
         if (strcmp(text, "Hex Viewer") == 0) { saw_program_name = true; }
         if (strcmp(text, "A:\\BIN\\HEXVIEW.ELF") == 0) { saw_program_path = true; }
@@ -291,6 +328,11 @@ static bool poll_event(struct book8gui_event *event)
     if (bounds_scenario) {
         check_bounds_stage();
     }
+    if (open_with_scenario && event_index == 0u) {
+        struct WindowApp *app = book8gui_launch_class(&book8_explorer_class);
+        assert(app != NULL);
+        app->bounds = (struct book8gui_rect){40u, 40u, 300u, 300u};
+    }
     if (editor_scenario && event_index == 0u) {
         struct WindowApp *app = book8gui_launch_class(&book8_editor_class);
         assert(app != NULL);
@@ -347,6 +389,20 @@ static bool read_file(const char *path, void *destination, uint32_t capacity,
     uint32_t *size)
 {
     ++editor_reads;
+    if (open_with_scenario) {
+        char expected[32];
+        for (uint32_t i = 0u; i < sizeof(open_with_files) / sizeof(open_with_files[0]); ++i) {
+            snprintf(expected, sizeof(expected), "A:\\%s", open_with_files[i]);
+            if (strcmp(path, expected) == 0) {
+                if (capacity < 4u)
+                    return false;
+                memcpy(destination, "test", 4u);
+                *size = 4u;
+                return true;
+            }
+        }
+        return false;
+    }
     if (editor_scenario && strcmp(path, "A:\\SCROLL.TXT") == 0) {
         assert(capacity >= 560u);
         for (uint32_t i = 0u; i < 80u; ++i) {
@@ -375,6 +431,14 @@ static bool write_file(const char *path, const void *data, uint32_t size)
 
 static bool file_info(const char *path, struct book8_file_info *info)
 {
+    if (open_with_scenario
+        && (strcmp(path, "A:\\BIN\\HEXVIEW.ELF") == 0
+            || strcmp(path, "A:\\BIN\\CODEEDIT.ELF") == 0
+            || strcmp(path, "A:\\BIN\\PAINTBK.ELF") == 0)) {
+        *info = (struct book8_file_info){.size = 1200u,
+            .allocated_bytes = 4096u, .allocation_valid = true};
+        return true;
+    }
     if (programs_scenario) {
         if (program_metadata_failure && strcmp(path, "A:\\BIN\\IMGVIEW.ELF") == 0) {
             return false;
@@ -538,6 +602,24 @@ static void do_reboot(void)
 static bool list_directory(const char *path,
     book8_directory_entry_fn visitor, void *context)
 {
+    if (open_with_scenario) {
+        if (strcmp(path, "A:\\") == 0) {
+            if (!visitor("BIN", true, 0u, context))
+                return false;
+            for (uint32_t i = 0u;
+                i < sizeof(open_with_files) / sizeof(open_with_files[0]); ++i) {
+                if (!visitor(open_with_files[i], false, 4u, context))
+                    return false;
+            }
+            return true;
+        }
+        if (strcmp(path, "A:\\BIN\\") == 0) {
+            return visitor("HEXVIEW.ELF", false, 1200u, context)
+                && visitor("CODEEDIT.ELF", false, 1200u, context)
+                && visitor("PAINTBK.ELF", false, 1200u, context);
+        }
+        return false;
+    }
     if (programs_scenario) {
         if (program_overflow) {
             for (uint32_t i = 0u; i < BOOK8GUI_MAX_PROGRAMS + 10u; ++i) {
@@ -1154,6 +1236,129 @@ int main(void)
     assert(book8gui_file_app(2u) == NULL);
     utility_scenario = false;
     programs_scenario = false;
+
+    /* Open With: association matrix, submenu handlers and no-association
+     * fallback. Each case gets a fresh desktop so a launched app cannot leak
+     * focus into the next one. */
+    static const char *const associations[][2] = {
+        {".TXT", "editor"}, {".INI", "editor"}, {".CFG", "editor"},
+        {".LOG", "editor"}, {".C", "codeedit"}, {".H", "codeedit"},
+        {".ASM", "codeedit"}, {".PS1", "codeedit"}
+    };
+    const char *assoc_path = "HKLM\\SOFTWARE\\BOOK8\\FileAssoc";
+    for (uint32_t i = 0u;
+        i < sizeof(associations) / sizeof(associations[0]); ++i) {
+        assert(reg_set_str(assoc_path, associations[i][0], associations[i][1]));
+    }
+    seed_open_with_program("CodeEditor", "Code Editor",
+        "A:\\BIN\\CODEEDIT.ELF", "codeedit");
+    seed_open_with_program("HexViewer", "Hex Viewer",
+        "A:\\BIN\\HEXVIEW.ELF", "hexview");
+    seed_open_with_program("PaintBook", "PaintBook",
+        "A:\\BIN\\PAINTBK.ELF", "paintbook");
+    open_with_scenario = true;
+    platform.launch_utility = host_launch_utility;
+    assert(book8gui_refresh_programs());
+    assert(book8gui_utility_installed(BOOK8_GUI_CODEEDIT));
+    assert(book8gui_utility_installed(BOOK8_GUI_HEXVIEW));
+    assert(book8gui_utility_installed(BOOK8_GUI_PAINTBOOK));
+    assert(book8gui_file_app(0u) == &book8_editor_class);
+    assert(book8gui_file_app(1u) == &book8_player_class);
+    assert(book8gui_file_app(2u) == &book8_codeedit_class);
+    assert(book8gui_file_app(3u) == &book8_hexview_class);
+    assert(book8gui_file_app(4u) == &book8_paintbook_class);
+    assert(book8gui_file_app(5u) == NULL);
+
+    for (uint32_t i = 0u;
+        i < sizeof(associations) / sizeof(associations[0]) + 1u; ++i) {
+        char expected[32];
+        event_count = event_index = 0u;
+        current_ticks = 0u;
+        trace_length = 0u;
+        trace[0] = '\0';
+        saw_no_association_status = false;
+        launch_utility_calls = 0u;
+        launch_utility_kind = 0u;
+        launch_utility_document[0] = '\0';
+        ticks = 1u;
+        add_click(explorer_row_x, explorer_row_y + 18u + i * 18u, &ticks);
+        add_key(BOOK8GUI_KEY_ENTER, ticks++);
+        add_click(start_x, start_y, &ticks);
+        add_click(40, 310, &ticks);
+        add_click(200, 310, &ticks);
+        assert(book8gui_run(&platform));
+        snprintf(expected, sizeof(expected), "A:\\%s", open_with_files[i]);
+        if (i < 4u) {
+            char opened[64];
+            snprintf(opened, sizeof(opened),
+                "BOOK8-NOTEEDITOR: opened path=%s", expected);
+            if (!contains(opened)) {
+                fprintf(stderr, "FAIL: Open With did not launch editor for %s\n%s\n",
+                    expected, trace);
+                return 1;
+            }
+        } else if (i < 8u) {
+            if (launch_utility_calls != 1u
+                || launch_utility_kind != BOOK8_GUI_CODEEDIT
+                || strcmp(launch_utility_document, expected) != 0) {
+                fprintf(stderr,
+                    "FAIL: Open With codeedit kind=%u doc=%s expected=%s\n",
+                    launch_utility_kind, launch_utility_document, expected);
+                return 1;
+            }
+        } else if (!saw_no_association_status) {
+            fprintf(stderr, "FAIL: Open With fallback status missing\n%s\n", trace);
+            return 1;
+        }
+    }
+
+    /* Right-click > Open With > each handler. Player is checked with a
+     * rejected type so the rejection text proves its open_path ran. */
+    for (uint32_t handler = 0u; handler < 5u; ++handler) {
+        const uint32_t row_y = explorer_row_y + 18u;
+        event_count = event_index = 0u;
+        current_ticks = 0u;
+        trace_length = 0u;
+        trace[0] = '\0';
+        launch_utility_calls = 0u;
+        launch_utility_kind = 0u;
+        launch_utility_document[0] = '\0';
+        ticks = 1u;
+        add_mouse(explorer_row_x, row_y, 2u, ticks++);
+        add_mouse(explorer_row_x, row_y, 0u, ticks++);
+        add_click(explorer_row_x + 5u, row_y + 7u * 18u + 4u, &ticks);
+        add_click(explorer_row_x + 5u, row_y + handler * 18u + 4u, &ticks);
+        add_click(start_x, start_y, &ticks);
+        add_click(40, 310, &ticks);
+        add_click(200, 310, &ticks);
+        assert(book8gui_run(&platform));
+        if (handler == 0u && !contains("BOOK8-NOTEEDITOR: opened path=A:\\KIND0.TXT")) {
+            fprintf(stderr, "FAIL: Open With editor handler\n%s\n", trace);
+            return 1;
+        }
+        if (handler == 1u
+            && !contains("title=\"BOOK8 Player\" registered")) {
+            fprintf(stderr, "FAIL: Open With player handler\n%s\n", trace);
+            return 1;
+        }
+        if (handler == 2u && (launch_utility_calls != 1u
+            || launch_utility_kind != BOOK8_GUI_CODEEDIT)) {
+            fprintf(stderr, "FAIL: Open With code editor handler\n%s\n", trace);
+            return 1;
+        }
+        if (handler == 3u && (launch_utility_calls != 1u
+            || launch_utility_kind != BOOK8_GUI_HEXVIEW)) {
+            fprintf(stderr, "FAIL: Open With hex viewer handler\n%s\n", trace);
+            return 1;
+        }
+        if (handler == 4u
+            && !contains("title=\"PaintBook\" registered")) {
+            fprintf(stderr, "FAIL: Open With paint handler\n%s\n", trace);
+            return 1;
+        }
+    }
+    open_with_scenario = false;
+    platform.launch_utility = NULL;
     printf("book8gui host test: PASS\n");
     return 0;
 }

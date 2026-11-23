@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "../include/syscall.h"
+#include "../kernel/smp.h"
 
 /* GDT selectors. Layout is dictated by STAR: SYSCALL loads CS=STAR[47:32],
  * SS=+8; SYSRET (64-bit) loads CS=STAR[63:48]+16, SS=+8, RPL forced to 3. */
@@ -40,6 +41,13 @@ struct syscall_percpu {
 };
 
 void syscall_init(void);
+/* Install the full GDT/TSS and syscall MSRs on a CPU. The BSP calls this from
+ * syscall_init(); APs call it before enabling their local timers. */
+void syscall_cpu_init(uint32_t cpu_id);
+/* Point the active TSS at a kernel privilege stack for the current task. */
+void syscall_select_kernel_stack(uint32_t cpu_id, uint64_t rsp);
+/* Read the privilege stack currently published in the CPU's TSS. */
+uint64_t syscall_current_kernel_stack(uint32_t cpu_id);
 void syscall_entry(void); /* LSTAR target (asm) */
 void syscall_dispatch(struct syscall_frame *frame);
 long book8_framebuffer_info(struct book8_fb_info *info);
@@ -61,5 +69,13 @@ void syscall_kill_current(long status);
 /* Map the user pages (U/S=1) and run the Ring 3 smoke task. Returns 0 on pass. */
 long syscall_ring3_smoke(void);
 long syscall_scheduler_smoke(struct exec_task *task, uint64_t delay_ticks);
+
+/* Kernel-side IPC injection. Used by kernel services to publish events to a
+ * user task through the same bounded queues as SYS_ipc_send/recv. */
+long book8_ipc_post(uint32_t port, uint32_t from_pid, const void *data,
+    uint32_t size);
+/* Kernel-side receive from any port, including messages sent by user tasks. */
+long book8_ipc_get(uint32_t port, void *data, uint32_t capacity);
+void book8_ipc_release_owner(uint32_t pid);
 
 #endif

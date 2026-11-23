@@ -31,6 +31,13 @@ extern uint64_t book8_read_cr3(void);
 extern void book8_write_cr3(uint64_t value);
 extern uint32_t book8_smp_current_cpu_index(void);
 extern void book8_sched_request_reschedule(uint32_t cpu_id);
+/* Strong version lives in src/syscall.c; hosted scheduler tests use this. */
+__attribute__((weak)) void syscall_select_kernel_stack(uint32_t cpu_id,
+    uint64_t rsp)
+{
+    (void)cpu_id;
+    (void)rsp;
+}
 
 static struct tcb threads[SCHED_MAX_THREADS];
 static struct sched_cpu cpus[BOOK8_SMP_MAX_CPUS];
@@ -539,6 +546,10 @@ struct timer_frame *sched_timer_tick_cpu(struct timer_frame *frame,
     cpu->current = next;
     if (next != previous && next->cr3 != previous_cr3)
         book8_write_cr3(next->cr3);
+    /* TSS RSP0 follows the incoming task: CPL3->CPL0 entries always land on
+     * the current task's kernel stack, on whichever CPU is running it. */
+    syscall_select_kernel_stack(cpu_id,
+        (uint64_t)&next->kernel_stack[SCHED_STACK_SIZE]);
     struct timer_frame *next_frame =
         next == previous ? frame : (struct timer_frame *)(uintptr_t)next->rsp;
     scheduler_lock_leave(flags);

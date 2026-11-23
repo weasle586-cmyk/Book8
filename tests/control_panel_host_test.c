@@ -315,6 +315,21 @@ static void test_panel(void)
     assert(book8_config_decode(&loaded, persisted, sizeof(persisted)));
     assert(loaded.values[BOOK8_CFG_NETWORK] == 1u);
     assert(memcmp(&network_settings, &original_network, sizeof(network_settings)) == 0);
+    /* F1 opens the About box from any category without adding a ninth category. */
+    drawn_size = 0u;
+    drawn[0] = '\0';
+    key(&app, BOOK8GUI_KEY_F1);
+    book8_settings_class.render(&platform, &app);
+    assert(strstr(drawn, "About BOOK8") != NULL);
+    assert(strstr(drawn, BOOK8_GUI_VERSION) != NULL);
+    assert(strstr(drawn, "A:\\DOC\\README.MD") != NULL);
+    assert(strstr(drawn, "A:\\DOC\\DEVREAD.MD") != NULL);
+    assert(strstr(drawn, "A:\\DOC\\KERNELNO.MD") != NULL);
+    key(&app, BOOK8GUI_KEY_ESCAPE);
+    drawn_size = 0u;
+    drawn[0] = '\0';
+    book8_settings_class.render(&platform, &app);
+    assert(strstr(drawn, "A:\\DOC\\README.MD") == NULL);
     /* Resizing and scrolling must not draw outside even the minimum window. */
     app.bounds = (struct book8gui_rect){0u, 0u, 240u, 160u};
     for (uint32_t page = 0u; page < 8u; ++page) {

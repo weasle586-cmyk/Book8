@@ -20,6 +20,16 @@
 extern uint64_t boot_pml4[];
 extern uint64_t book8_read_cr3(void);
 extern void book8_write_cr3(uint64_t value);
+/* Hosted exec tests link without the syscall/SMP modules. */
+__attribute__((weak)) void book8_ipc_release_owner(uint32_t pid) { (void)pid; }
+__attribute__((weak)) void book8_sched_request_reschedule(uint32_t cpu_id)
+{ (void)cpu_id; }
+__attribute__((weak)) uint64_t syscall_current_kernel_stack(uint32_t cpu_id)
+{ (void)cpu_id; return 0u; }
+/* Hosted exec tests build without the boot hash manifest module. */
+__attribute__((weak)) bool boot_hash_verify_file(const char *path,
+    file_handle_t *file)
+{ (void)path; (void)file; return true; }
 
 static uint8_t page_pool[EXEC_MAX_TASKS][POOL_PAGES][4096]
     __attribute__((aligned(4096)));
@@ -32,6 +42,13 @@ static uint64_t test_pml4[2][512] __attribute__((aligned(4096)));
 static struct exec_task tasks[EXEC_MAX_TASKS];
 static struct exec_task *current;
 static uint32_t next_pid = 1u;
+/* Kernel frame parked while background user tasks run. User scheduling is
+ * currently BSP-owned, matching the existing kernel-centric device model. */
+static struct timer_frame *exec_kernel_frame;
+static uint64_t exec_kernel_cr3;
+static uint64_t exec_kernel_rsp0;
+static bool exec_kernel_frame_saved;
+static bool exec_sync_active;
 static bool scheduler_test_active;
 static uint32_t scheduler_quantum;
 static volatile uint64_t scheduler_ticks;
@@ -41,6 +58,8 @@ static volatile uint64_t scheduler_work[2];
 static volatile uint64_t scheduler_error[2];
 
 #define SCHEDULER_QUANTUM_TICKS 2u
+
+static void task_release(struct exec_task *task);
 
 static void invalidate_user_page(uint64_t address)
 {
@@ -143,38 +162,121 @@ bool exec_scheduler_test_finish(void)
     return passed;
 }
 
+static bool has_ready_user_task(void)
+{
+    for (unsigned i = 0u; i < EXEC_MAX_TASKS; ++i) {
+        if (tasks[i].state == TASK_READY)
+            return true;
+    }
+    return false;
+}
+
+bool exec_user_scheduler_active(void)
+{
+    return scheduler_test_active || exec_sync_active || current != 0
+        || has_ready_user_task();
+}
+
+static struct exec_task *next_ready_user_task(struct exec_task *after)
+{
+    unsigned start = after == 0 ? 0u : (unsigned)(after - tasks) + 1u;
+
+    for (unsigned offset = 0u; offset < EXEC_MAX_TASKS; ++offset) {
+        struct exec_task *next = &tasks[(start + offset) % EXEC_MAX_TASKS];
+        if (next->state == TASK_READY)
+            return next;
+    }
+    return 0;
+}
+
+void exec_task_finish(struct exec_task *task, long status)
+{
+    if (task == 0)
+        return;
+    task->exit_status = status;
+    task->state = TASK_TERMINATED;
+}
+
 struct timer_frame *exec_timer_tick(struct timer_frame *frame)
 {
-    if (current == 0 || current->state != TASK_RUNNING)
-        return frame;
-    ++scheduler_ticks;
-    if (--scheduler_quantum != 0u)
-        return frame;
-    scheduler_quantum = SCHEDULER_QUANTUM_TICKS;
-    unsigned index = (unsigned)(current - tasks);
-    for (unsigned offset = 1u; offset < EXEC_MAX_TASKS; ++offset) {
-        struct exec_task *next = &tasks[(index + offset) % EXEC_MAX_TASKS];
-        if (next->state == TASK_READY) {
-            if (scheduler_test_active && (frame->cs & 3u) == 3u)
-                ++scheduler_user_switches;
-            if (scheduler_test_active && (frame->cs & 3u) == 3u) {
-                uintptr_t frame_address = (uintptr_t)frame;
-                uintptr_t stack_end = (uintptr_t)current->kernel_stack
-                    + EXEC_KERNEL_STACK_SIZE;
-                if (frame_address != stack_end - sizeof(*frame))
-                    ++scheduler_user_stack_errors;
+    struct exec_task *next;
+
+    /* Legacy scheduler self-test uses its own frame rotation and assertions. */
+    if (scheduler_test_active) {
+        if (current == 0 || current->state != TASK_RUNNING)
+            return frame;
+        ++scheduler_ticks;
+        if (--scheduler_quantum != 0u)
+            return frame;
+        scheduler_quantum = SCHEDULER_QUANTUM_TICKS;
+        unsigned index = (unsigned)(current - tasks);
+        for (unsigned offset = 1u; offset < EXEC_MAX_TASKS; ++offset) {
+            next = &tasks[(index + offset) % EXEC_MAX_TASKS];
+            if (next->state == TASK_READY) {
+                if ((frame->cs & 3u) == 3u)
+                    ++scheduler_user_switches;
+                if ((frame->cs & 3u) == 3u) {
+                    uintptr_t frame_address = (uintptr_t)frame;
+                    uintptr_t stack_end = (uintptr_t)current->kernel_stack
+                        + EXEC_KERNEL_STACK_SIZE;
+                    if (frame_address != stack_end - sizeof(*frame))
+                        ++scheduler_user_stack_errors;
+                }
+                current->rsp = (uint64_t)frame;
+                current->state = TASK_READY;
+                next->state = TASK_RUNNING;
+                current = next;
+                syscall_select_task(next);
+                if (book8_read_cr3() != next->cr3)
+                    book8_write_cr3(next->cr3);
+                return (struct timer_frame *)next->rsp;
             }
+        }
+        return frame;
+    }
+
+    /* The shell's synchronous exec path still owns its kernel stack. */
+    if (exec_sync_active)
+        return frame;
+    if (current == 0 && !has_ready_user_task())
+        return frame;
+
+    if (!exec_kernel_frame_saved) {
+        exec_kernel_frame = frame;
+        exec_kernel_cr3 = book8_read_cr3();
+        exec_kernel_rsp0 = syscall_current_kernel_stack(0u);
+        exec_kernel_frame_saved = true;
+    }
+    if (current != 0) {
+        if (current->state == TASK_TERMINATED || current->state == TASK_FREE) {
+            book8_ipc_release_owner(current->pid);
+            task_release(current);
+            current = 0;
+        } else if (current->state == TASK_RUNNING) {
             current->rsp = (uint64_t)frame;
+            current->cr3 = book8_read_cr3();
             current->state = TASK_READY;
-            next->state = TASK_RUNNING;
-            current = next;
-            syscall_select_task(next);
-            if (book8_read_cr3() != next->cr3)
-                book8_write_cr3(next->cr3);
-            return (struct timer_frame *)next->rsp;
         }
     }
-    return frame;
+
+    next = next_ready_user_task(current);
+    if (next == 0) {
+        struct timer_frame *kernel_frame = exec_kernel_frame;
+        current = 0;
+        if (book8_read_cr3() != exec_kernel_cr3)
+            book8_write_cr3(exec_kernel_cr3);
+        syscall_select_kernel_stack(0u, exec_kernel_rsp0);
+        exec_kernel_frame = 0;
+        exec_kernel_frame_saved = false;
+        return kernel_frame;
+    }
+
+    next->state = TASK_RUNNING;
+    current = next;
+    syscall_select_task(next);
+    if (book8_read_cr3() != next->cr3)
+        book8_write_cr3(next->cr3);
+    return (struct timer_frame *)next->rsp;
 }
 
 /* Kernel-side copies of path/argv: execve frees the old image, so nothing may
@@ -1375,6 +1477,8 @@ static void task_release(struct exec_task *task)
 {
     if (task == 0)
         return;
+    if (task->pid != 0u)
+        book8_ipc_release_owner(task->pid);
     close_fds(task);
     modules_destroy(task);
     if (task->address_space_slot < EXEC_MAX_TASKS)
@@ -2041,6 +2145,111 @@ static long prepare_executable_modules(struct exec_task *task,
     return resolve_loaded_imports(task, main_file, main_img);
 }
 
+/* Background tasks enter Ring 3 from a timer interrupt frame rather than from
+ * the synchronous shell stack. On SYS_exit the syscall path unwinds back here
+ * and the task is retired by the user scheduler on the next tick. */
+void exec_user_entry_trampoline(struct exec_task *task)
+{
+    long status = syscall_run_user(task);
+
+    exec_task_finish(task, status);
+    book8_sched_request_reschedule(0u);
+    for (;;)
+        __asm__ volatile ("cli; hlt");
+}
+
+static void prepare_user_entry_frame(struct exec_task *task)
+{
+    uint64_t top = (uint64_t)&task->kernel_stack[EXEC_KERNEL_STACK_SIZE];
+    struct timer_frame *frame =
+        (struct timer_frame *)(uintptr_t)(top - 8u - sizeof(*frame));
+
+    *frame = (struct timer_frame){0};
+    frame->rip = (uint64_t)exec_user_entry_trampoline;
+    frame->rdi = (uint64_t)task;
+    frame->cs = 0x08u;
+    frame->rflags = 0x202u;
+    frame->rsp = top - 8u;
+    frame->ss = 0x10u;
+    task->rsp = (uint64_t)(uintptr_t)frame;
+    task->state = TASK_READY;
+}
+
+long exec_spawn_user(const char *path, uint64_t argv)
+{
+    static struct elf_image image;
+    struct exec_task *task;
+    file_handle_t *file;
+    uint32_t argc = 0u, used = 0u;
+    uint64_t rsp;
+    long status;
+
+    if (path == 0 || path[0] == '\0')
+        return -BOOK8_EINVAL;
+    if (argv != 0u) {
+        while (argc < EXEC_MAX_ARGS) {
+            uint64_t ptr;
+            long len;
+
+            if (!user_read_bytes(&ptr, argv + (uint64_t)argc * 8u, 8u))
+                return -BOOK8_EFAULT;
+            if (ptr == 0u)
+                break;
+            len = user_read_string(arg_store + used, EXEC_ARG_BYTES - used, ptr);
+            if (len < 0)
+                return len;
+            arg_ptrs[argc++] = arg_store + used;
+            used += (uint32_t)len + 1u;
+        }
+        if (argc == EXEC_MAX_ARGS)
+            return -BOOK8_EINVAL;
+    }
+    arg_ptrs[argc] = 0;
+
+    task = task_reserve();
+    if (task == 0)
+        return -BOOK8_EMFILE;
+    file = fs_open_any(path);
+    if (file == 0) {
+        task_release(task);
+        return -BOOK8_ENOENT;
+    }
+    if (!boot_hash_verify_file(path, file)) {
+        fs_close(file);
+        task_release(task);
+        return -BOOK8_EPERM;
+    }
+    status = elf_inspect(file, &image);
+    if (status == 0)
+        status = elf_require_executable(&image);
+    if (status == 0)
+        status = elf_load_into(task, file, &image, 0u);
+    if (status == 0)
+        status = prepare_executable_modules(task, path, file, &image);
+    fs_close(file);
+    if (status == 0)
+        status = build_stack(task, (int)argc, arg_ptrs, &rsp);
+    if (status != 0) {
+        task_release(task);
+        return status;
+    }
+
+    task->pid = next_pid++;
+    struct book8_session_info session;
+    if (book8_session_current(&session)) {
+        task->uid = session.uid;
+        task->session_token = session.token;
+    } else {
+        task->uid = UINT32_MAX;
+        task->session_token = 0u;
+    }
+    task->entry = image.entry;
+    task->user_rsp = rsp;
+    set_name(task, path);
+    prepare_user_entry_frame(task);
+    return (long)task->pid;
+}
+
 long exec_run(const char *path, int argc, char **argv)
 {
     struct elf_image *img;
@@ -2050,7 +2259,7 @@ long exec_run(const char *path, int argc, char **argv)
     uint64_t rsp;
     long status;
 
-    if (current != 0 || path == 0) {
+    if (current != 0 || exec_sync_active || path == 0) {
         return -BOOK8_EINVAL;
     }
     task = task_reserve();
@@ -2061,6 +2270,11 @@ long exec_run(const char *path, int argc, char **argv)
     if (file == 0) {
         task_release(task);
         return -BOOK8_ENOENT;
+    }
+    if (!boot_hash_verify_file(path, file)) {
+        fs_close(file);
+        task_release(task);
+        return -BOOK8_EPERM;
     }
     img = &image;
     status = elf_inspect(file, img);
@@ -2097,6 +2311,7 @@ long exec_run(const char *path, int argc, char **argv)
     task->user_rsp = rsp;
     set_name(task, path);
     current = task;
+    exec_sync_active = true;
     scheduler_quantum = SCHEDULER_QUANTUM_TICKS;
     if (book8_read_cr3() != task->cr3)
         book8_write_cr3(task->cr3);
@@ -2105,8 +2320,10 @@ long exec_run(const char *path, int argc, char **argv)
 
     task->exit_status = status;
     task->state = TASK_TERMINATED;
+    book8_ipc_release_owner(task->pid);
     task_release(task);
     current = 0;
+    exec_sync_active = false;
     return status;
 }
 
@@ -2235,6 +2452,10 @@ long exec_sys_execve(struct syscall_frame *frame, uint64_t path, uint64_t argv)
     }
     if (file == 0) {
         return -BOOK8_ENOENT;
+    }
+    if (!boot_hash_verify_file(path_store, file)) {
+        fs_close(file);
+        return -BOOK8_EPERM;
     }
     status = elf_inspect(file, &image);
     if (status != 0) {

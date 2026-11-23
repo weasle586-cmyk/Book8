@@ -45,6 +45,20 @@
 #define DESKTOP_MIN_WIDTH 240u
 #define DESKTOP_MIN_HEIGHT 160u
 
+/* Frozen UI geometry. QEMU tests derive click coordinates from these values
+ * (tests/ui_geometry.py); a layout change must update that module too. */
+_Static_assert(BOOK8GUI_TASKBAR_HEIGHT == 36u,
+    "taskbar height is frozen at 36px");
+_Static_assert(DESKTOP_TOP_HEIGHT == 32u,
+    "desktop top height is frozen at 32px");
+_Static_assert(DESKTOP_START_WIDTH == 92u,
+    "start button width is frozen at 92px");
+_Static_assert(DESKTOP_MENU_X == 4u, "menu x is frozen at 4px");
+_Static_assert(DESKTOP_MENU_WIDTH == 150u, "menu width is frozen at 150px");
+_Static_assert(DESKTOP_MENU_ROW == 20u, "menu row height is frozen at 20px");
+_Static_assert(BOOK8GUI_MAX_PROGRAMS == BOOK8_MAX_PROGRAMS,
+    "GUI program capacity is frozen to BOOK8_MAX_PROGRAMS");
+
 #define DRAG_NONE 0u
 #define DRAG_MOVE 0x10u
 #define DRAG_LEFT 0x01u
@@ -81,6 +95,8 @@ static const struct book8gui_menu_item start_menu[] = {
 };
 
 #define START_MENU_COUNT (sizeof(start_menu) / sizeof(start_menu[0]))
+_Static_assert(START_MENU_COUNT == 3u,
+    "root menu is frozen at Programs/Settings/Shutdown (3 rows)");
 
 struct desktop_state {
     const struct book8gui_platform *platform;
@@ -622,6 +638,45 @@ bool book8gui_refresh_programs(void)
     }
     if (registry_programs_active) {
         sort_programs();
+    }
+    /* Publish the actual Programs menu rows so QEMU and host tests can click
+     * by label instead of by a hardcoded index. Adding or removing an ELF
+     * changes these rows, so the diagnostic must follow the same iteration
+     * order as menu_program_index(). */
+    if (desktop.platform->diagnostic != NULL) {
+        char row_line[192];
+        uint32_t row = 0u;
+        if (registry_programs_active) {
+            /* Registry mode replaces the static menu: rows are all non-hidden
+             * registry entries, in the order used by menu_program_index(). */
+            for (uint32_t i = program_entries_start(); i < registered_count; ++i) {
+                const struct book8gui_program *entry = &registered_programs[i];
+                if (entry->hidden) { continue; }
+                snprintf(row_line, sizeof(row_line), "PROGRAM-MENU-ROW: %u|%.64s|%s",
+                         row, entry->name, entry->path);
+                desktop.platform->diagnostic(row_line);
+                desktop.platform->diagnostic("\n");
+                ++row;
+            }
+        } else {
+            for (; row < PROGRAMS_MENU_COUNT; ++row) {
+                snprintf(row_line, sizeof(row_line), "PROGRAM-MENU-ROW: %u|%s|%s",
+                         row, programs_menu[row].label,
+                         programs_menu[row].executable_path != NULL
+                             ? programs_menu[row].executable_path : "");
+                desktop.platform->diagnostic(row_line);
+                desktop.platform->diagnostic("\n");
+            }
+            for (uint32_t i = 5u; i < registered_count; ++i) {
+                const struct book8gui_program *entry = &registered_programs[i];
+                if (static_program_path(entry->path)) { continue; }
+                snprintf(row_line, sizeof(row_line), "PROGRAM-MENU-ROW: %u|%.64s|%s",
+                         row, entry->name, entry->path);
+                desktop.platform->diagnostic(row_line);
+                desktop.platform->diagnostic("\n");
+                ++row;
+            }
+        }
     }
     if (program_scan.incomplete) {
         char report[128];
